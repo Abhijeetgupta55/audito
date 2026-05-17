@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: audito-api
+    env: python
+    region: oregon
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_VISION_MODEL
+        value: gemini-2.5-flash
+      - key: DEBUG
+        value: false
+      - key: AUDITO_DATA_DIR
+        value: /tmp/audito-data
+      - key: CHROMA_DB_PATH
+        value: /tmp/chroma_db
+      # Set these in the Render dashboard — do NOT commit values
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Optional — leave blank to use local JSON file store
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false

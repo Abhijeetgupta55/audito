@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Runtime data (ephemeral — use Supabase or Render persistent disk in production)
+data/
+chroma_db/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Frontend (has its own .gitignore for node_modules/dist)
+frontend/node_modules/
+frontend/dist/
