@@ -131,7 +131,7 @@ class RecommendProductsRequest(BaseModel):
 @app.get("/test-gemini")
 async def test_gemini():
     """Diagnostic endpoint — tests raw Gemini connectivity in isolation."""
-    from backend.agents import _ensure_gemini, _generate
+    from backend.agents import _ensure_gemini, _agenerate
     key_set = bool(settings.GEMINI_API_KEY)
     if not key_set:
         return {"status": "error", "reason": "GEMINI_API_KEY not set on this server"}
@@ -139,12 +139,12 @@ async def test_gemini():
     if not client_ok:
         return {"status": "error", "reason": "Gemini client failed to initialize (key may be invalid)"}
     try:
-        result = _generate(["Say hello in exactly 5 words."], max_tokens=30)
+        result = await _agenerate(["Say hello in exactly 5 words."], max_tokens=30, retries=1)
         if result:
             return {"status": "ok", "model": settings.GEMINI_MODEL, "response": result}
         return {
             "status": "error",
-            "reason": "Gemini returned empty response — model may be invalid or rate-limited",
+            "reason": "Gemini returned empty response — check Render logs for finish_reason",
             "model": settings.GEMINI_MODEL,
         }
     except Exception as e:

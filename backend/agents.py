@@ -7,10 +7,11 @@ Agent routing:
   diagnosis → (mild/moderate, no Rx needed) → search → recommendation → safety [END]
   diagnosis → (severe / Rx needed) → doctor_expert → safety [END]
 """
+import asyncio
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -46,61 +47,166 @@ _SAFETY_OFF = [
 ]
 
 
-def _safe_text(response) -> str:
-    """Extract text from a Gemini response without crashing on blocked outputs."""
+def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
+    """
+    Parse a Gemini response into (text, finish_reason, safety_info).
+    Never assumes response.text exists — walks candidates/parts directly.
+    Also logs token usage, finish_reason, safety ratings, and blocked reasons.
+    """
+    text = ""
+    finish_reason = "UNKNOWN"
+    safety_info = ""
+
     try:
-        return response.text or ""
-    except Exception:
-        pass
-    try:
-        for candidate in (response.candidates or []):
-            for part in (candidate.content.parts or []):
-                t = getattr(part, "text", None)
-                if t:
-                    return t
-    except Exception:
-        pass
-    return ""
+        # Prompt-level block (fires before any candidate is generated)
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        if prompt_feedback:
+            block_reason = getattr(prompt_feedback, "block_reason", None)
+            if block_reason and str(block_reason) not in ("None", "BLOCK_REASON_UNSPECIFIED", "0"):
+                logger.warning(f"[{model_name}] Prompt blocked — block_reason={block_reason}")
+                return "", f"PROMPT_BLOCKED:{block_reason}", ""
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            logger.warning(f"[{model_name}] Response has no candidates")
+            return "", "NO_CANDIDATES", ""
+
+        candidate = candidates[0]
+
+        # Finish reason
+        raw_fr = getattr(candidate, "finish_reason", None)
+        finish_reason = str(raw_fr) if raw_fr is not None else "None"
+
+        # Safety ratings — enumerate enum names safely
+        safety_ratings = getattr(candidate, "safety_ratings", None) or []
+        if safety_ratings:
+            parts_sr = []
+            for r in safety_ratings:
+                cat = getattr(r, "category", "?")
+                cat_str = cat.name if hasattr(cat, "name") else str(cat)
+                prob = getattr(r, "probability", "?")
+                prob_str = prob.name if hasattr(prob, "name") else str(prob)
+                parts_sr.append(f"{cat_str}={prob_str}")
+            safety_info = " | ".join(parts_sr)
+
+        # Log unexpected finish reasons (not STOP / not thought)
+        stop_values = {"FinishReason.STOP", "STOP", "1", "None", "FINISH_REASON_STOP"}
+        if finish_reason not in stop_values:
+            logger.warning(
+                f"[{model_name}] Non-STOP finish: finish_reason={finish_reason} "
+                f"safety=[{safety_info}]"
+            )
+
+        # Walk content parts — skip thought parts (present in 2.5 when budget>0)
+        content = getattr(candidate, "content", None)
+        if content:
+            for part in (getattr(content, "parts", None) or []):
+                # gemini-2.5: thought parts carry thought=True attribute
+                if getattr(part, "thought", False):
+                    continue
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    text += part_text
+
+        # Token usage
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            in_tok = getattr(usage, "prompt_token_count", "?")
+            out_tok = getattr(usage, "candidates_token_count", "?")
+            thought_tok = getattr(usage, "thoughts_token_count", None) or 0
+            logger.info(
+                f"[{model_name}] tokens in={in_tok} out={out_tok} thought={thought_tok}"
+            )
+
+    except Exception as exc:
+        logger.error(f"_extract_response [{model_name}]: parse error — {exc}")
+
+    return text, finish_reason, safety_info
 
 
 def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None) -> str:
-    """Call Gemini and return the text response. Never raises."""
+    """
+    Single synchronous Gemini call. Never raises, never retries.
+    For retry logic use _agenerate() (async).
+    """
     if not _ensure_gemini():
-        logger.error("_generate: client not ready — GEMINI_API_KEY missing or init failed")
+        logger.error("_generate: Gemini client not ready — GEMINI_API_KEY missing")
         return ""
+
     name = model_name or settings.GEMINI_MODEL
-    prompt_preview = str(prompt_parts[0])[:80] if prompt_parts else ""
-    logger.info(f"_generate → model={name} preview={prompt_preview!r}")
+    preview = str(prompt_parts[0])[:100] if prompt_parts else ""
+    logger.info(f"_generate → {name} | {preview!r}")
+
     try:
         cfg_kwargs: Dict[str, Any] = {
             "safety_settings": _SAFETY_OFF,
             "max_output_tokens": max_tokens,
         }
-        # thinking_budget=0 (disable thinking) is only valid on gemini-2.5+ models
+        # thinking_budget=0 disables extended thinking — only valid on gemini-2.5+ models
         if "2.5" in name:
             cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
             model=name,
             contents=prompt_parts,
             config=cfg,
         )
-        text = _safe_text(response)
-        logger.info(f"_generate ← {len(text)} chars from {name}")
-        if not text:
-            logger.warning(f"_generate: empty response from {name} (blocked/filtered?)")
+
+        text, finish_reason, safety_info = _extract_response(response, name)
+
+        if text:
+            logger.info(f"_generate ← {len(text)} chars | finish={finish_reason}")
+        else:
+            logger.warning(
+                f"_generate: EMPTY response | model={name} finish={finish_reason} "
+                f"safety=[{safety_info}]"
+            )
         return text
+
     except Exception as e:
         err = str(e)
         if "429" in err:
-            logger.warning(f"_generate: 429 rate-limited on {name}")
+            logger.warning(f"_generate: 429 rate-limited [{name}]")
         elif "404" in err or "not found" in err.lower():
-            logger.error(f"_generate: 404 model not found — '{name}' may be invalid. Full error: {err[:400]}")
-        elif "403" in err or "permission" in err.lower() or "api key" in err.lower():
-            logger.error(f"_generate: auth/permission error — check GEMINI_API_KEY. Full error: {err[:400]}")
+            logger.error(f"_generate: 404 model not found '{name}' — {err[:300]}")
+        elif "403" in err or "api key" in err.lower() or "permission" in err.lower():
+            logger.error(f"_generate: auth error — verify GEMINI_API_KEY — {err[:300]}")
         else:
-            logger.error(f"_generate: failed [{name}]: {err[:400]}")
+            logger.error(f"_generate: exception [{name}]: {err[:300]}")
         return ""
+
+
+async def _agenerate(
+    prompt_parts: list,
+    model_name: str = None,
+    max_tokens: int = None,
+    retries: int = 1,
+) -> str:
+    """
+    Async wrapper around _generate with non-blocking retry on transient empty.
+    retries=0 → single attempt (use for fast conversational paths).
+    retries=1 → one retry after 1.5s (default).
+    retries=2 → two retries for critical paths (vision).
+    """
+    for attempt in range(retries + 1):
+        text = _generate(prompt_parts, model_name, max_tokens)
+        if text:
+            return text
+        if attempt < retries:
+            wait = 1.5 * (attempt + 1)
+            logger.warning(
+                f"_agenerate: empty on attempt {attempt + 1}/{retries + 1} — "
+                f"retrying in {wait:.1f}s"
+            )
+            await asyncio.sleep(wait)
+
+    name = model_name or settings.GEMINI_MODEL
+    logger.error(
+        f"_agenerate: all {retries + 1} attempt(s) returned empty "
+        f"[model={name}] — check Render logs for finish_reason"
+    )
+    return ""
 
 
 def _parse_json(text: str) -> Dict:
@@ -269,7 +375,11 @@ Respond ONLY with valid JSON:
         result = None
         if _ensure_gemini():
             try:
-                text = _generate([self.SYSTEM, f"\nUser message: {state.user_message}"], max_tokens=200)
+                text = await _agenerate(
+                    [self.SYSTEM, f"\nUser message: {state.user_message}"],
+                    max_tokens=200,
+                    retries=1,
+                )
                 result = _parse_json(text)
                 logger.info(f"Triage LLM result: {result}")
             except Exception as e:
@@ -366,7 +476,12 @@ Respond ONLY in valid JSON:
                 data=img_bytes,
                 mime_type=state.image_type or "image/jpeg",
             )
-            text = _generate([self.SYSTEM, img_part], model_name=settings.GEMINI_VISION_MODEL, max_tokens=800)
+            text = await _agenerate(
+                [self.SYSTEM, img_part],
+                model_name=settings.GEMINI_VISION_MODEL,
+                max_tokens=800,
+                retries=2,
+            )
             logger.info(f"Vision raw response: {len(text)} chars — preview: {text[:120]!r}")
 
             # Step 1: check if model returned anything at all
@@ -586,7 +701,11 @@ Rules:
                 f"Concern category: {state.identified_concern.replace('_', ' ')}"
             )
             try:
-                intake_raw = _generate([self.INTAKE_SYSTEM, intake_prompt], max_tokens=150)
+                intake_raw = await _agenerate(
+                    [self.INTAKE_SYSTEM, intake_prompt],
+                    max_tokens=150,
+                    retries=1,
+                )
                 intake = _parse_json(intake_raw)
             except Exception as e:
                 logger.error(f"Intake evaluation failed: {e}")
@@ -622,7 +741,11 @@ Rules:
 
         diagnosis_data_parsed: Dict[str, Any] = {}
         try:
-            raw_diff = _generate([self.DIFFERENTIAL_SYSTEM, diff_prompt], max_tokens=350).strip()
+            raw_diff = (await _agenerate(
+                [self.DIFFERENTIAL_SYSTEM, diff_prompt],
+                max_tokens=350,
+                retries=1,
+            )).strip()
             if raw_diff:
                 diagnosis_data_parsed = _parse_json(raw_diff)
                 if diagnosis_data_parsed and diagnosis_data_parsed.get("diagnosis_summary"):
@@ -734,7 +857,11 @@ Style: direct, conversational, no filler phrases. Match the energy of the messag
             else f"User: {state.user_message}"
         )
 
-        reply = _generate([self.SYSTEM, context], max_tokens=500).strip()
+        reply = (await _agenerate(
+            [self.SYSTEM, context],
+            max_tokens=300,
+            retries=0,
+        )).strip()
 
         if not reply:
             if not settings.GEMINI_API_KEY:
@@ -1000,7 +1127,11 @@ Rules:
                 else:
                     ctx += "Apply established clinical dermatology knowledge for this concern."
                     logger.info("Stage1 LLM: no KB context — using clinical training knowledge")
-                raw = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=350).strip()
+                raw = (await _agenerate(
+                    [self.INGREDIENTS_SYSTEM, ctx],
+                    max_tokens=350,
+                    retries=1,
+                )).strip()
                 parsed = _parse_json(raw)
                 actives = parsed.get("actives", []) if parsed else []
                 if actives:
@@ -1065,7 +1196,11 @@ Rules:
                     f"Dermatology Knowledge Context:\n{state.kb_context or ''}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                raw = _generate([self.PRODUCTS_SYSTEM, ctx], max_tokens=350).strip()
+                raw = (await _agenerate(
+                    [self.PRODUCTS_SYSTEM, ctx],
+                    max_tokens=350,
+                    retries=1,
+                )).strip()
                 rec_data = _parse_json(raw) or {}
                 if rec_data.get("product_rationale"):
                     lines = [
@@ -1120,7 +1255,11 @@ Rules:
                     f"Dermatology Knowledge Context:\n{state.kb_context}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                raw = _generate([self.SYSTEM, user_ctx], max_tokens=450).strip()
+                raw = (await _agenerate(
+                    [self.SYSTEM, user_ctx],
+                    max_tokens=450,
+                    retries=1,
+                )).strip()
                 rec_data = _parse_json(raw) or {}
                 actives = rec_data.get("actives", [])
                 if actives:
@@ -1177,7 +1316,11 @@ Rules:
                     f"Concern: {state.identified_concern.replace('_', ' ')} — {state.severity}\n"
                     f"User description: {state.user_message}"
                 )
-                guidance = _generate([self.SYSTEM, ctx], max_tokens=220).strip()
+                guidance = (await _agenerate(
+                    [self.SYSTEM, ctx],
+                    max_tokens=220,
+                    retries=1,
+                )).strip()
             except Exception as e:
                 logger.error(f"Doctor Expert Agent failed: {e}")
 
