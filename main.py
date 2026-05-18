@@ -128,20 +128,50 @@ class RecommendProductsRequest(BaseModel):
 # STARTUP
 # ============================================================================
 
+@app.get("/test-gemini")
+async def test_gemini():
+    """Diagnostic endpoint — tests raw Gemini connectivity in isolation."""
+    from backend.agents import _ensure_gemini, _generate
+    key_set = bool(settings.GEMINI_API_KEY)
+    if not key_set:
+        return {"status": "error", "reason": "GEMINI_API_KEY not set on this server"}
+    client_ok = _ensure_gemini()
+    if not client_ok:
+        return {"status": "error", "reason": "Gemini client failed to initialize (key may be invalid)"}
+    try:
+        result = _generate(["Say hello in exactly 5 words."], max_tokens=30)
+        if result:
+            return {"status": "ok", "model": settings.GEMINI_MODEL, "response": result}
+        return {
+            "status": "error",
+            "reason": "Gemini returned empty response — model may be invalid or rate-limited",
+            "model": settings.GEMINI_MODEL,
+        }
+    except Exception as e:
+        return {"status": "error", "reason": str(e), "model": settings.GEMINI_MODEL}
+
+
 @app.get("/health")
 async def health_check():
     store = await get_pinecone_store()
+    gemini_configured = bool(settings.GEMINI_API_KEY)
     return {
-        "status": "healthy",
+        "status": "healthy" if gemini_configured else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "products_loaded": len(store.products),
         "model": settings.GEMINI_MODEL,
+        "gemini_configured": gemini_configured,
+        "warnings": [] if gemini_configured else ["GEMINI_API_KEY not set — LLM calls will fail"],
     }
 
 
 @app.on_event("startup")
 async def startup():
     logger.info("🚀 Audito API starting up")
+    if settings.GEMINI_API_KEY:
+        logger.info(f"✅ GEMINI_API_KEY set (model={settings.GEMINI_MODEL})")
+    else:
+        logger.error("❌ GEMINI_API_KEY is NOT set — all AI responses will use fallback text. Add this env var on Render.")
     store = await get_pinecone_store()
     logger.info(f"✅ Product store ready ({len(store.products)} products)")
     await get_orchestrator()

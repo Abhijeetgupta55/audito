@@ -30,7 +30,10 @@ _client: Optional["genai.Client"] = None
 
 def _ensure_gemini() -> bool:
     global _client
-    if _client is None and settings.GEMINI_API_KEY:
+    if _client is None:
+        if not settings.GEMINI_API_KEY:
+            logger.error("GEMINI_API_KEY is not set — all LLM calls will be skipped. Set this env var on Render.")
+            return False
         _client = genai.Client(api_key=settings.GEMINI_API_KEY)
     return _client is not None
 
@@ -63,8 +66,11 @@ def _safe_text(response) -> str:
 def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None) -> str:
     """Call Gemini and return the text response. Never raises."""
     if not _ensure_gemini():
+        logger.error("_generate: client not ready — GEMINI_API_KEY missing or init failed")
         return ""
     name = model_name or settings.GEMINI_MODEL
+    prompt_preview = str(prompt_parts[0])[:80] if prompt_parts else ""
+    logger.info(f"_generate → model={name} preview={prompt_preview!r}")
     try:
         cfg = genai_types.GenerateContentConfig(
             safety_settings=_SAFETY_OFF,
@@ -76,13 +82,21 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
             contents=prompt_parts,
             config=cfg,
         )
-        return _safe_text(response)
+        text = _safe_text(response)
+        logger.info(f"_generate ← {len(text)} chars from {name}")
+        if not text:
+            logger.warning(f"_generate: empty response from {name} (blocked/filtered?)")
+        return text
     except Exception as e:
         err = str(e)
         if "429" in err:
-            logger.warning(f"Rate limited on {name} — quota exhausted, returning empty")
+            logger.warning(f"_generate: 429 rate-limited on {name}")
+        elif "404" in err or "not found" in err.lower():
+            logger.error(f"_generate: 404 model not found — '{name}' may be invalid. Full error: {err[:400]}")
+        elif "403" in err or "permission" in err.lower() or "api key" in err.lower():
+            logger.error(f"_generate: auth/permission error — check GEMINI_API_KEY. Full error: {err[:400]}")
         else:
-            logger.error(f"Gemini generate failed [{name}]: {err[:200]}")
+            logger.error(f"_generate: failed [{name}]: {err[:400]}")
         return ""
 
 
@@ -699,8 +713,12 @@ Style: direct, conversational, no filler phrases. Match the energy of the messag
         reply = _generate([self.SYSTEM, context], max_tokens=500).strip()
 
         if not reply:
-            logger.warning("Conversational Agent: Gemini returned empty — API may be unavailable")
-            reply = "I'm having trouble reaching the AI right now. Please try again in a moment."
+            if not settings.GEMINI_API_KEY:
+                logger.error("ConversationalAgent: GEMINI_API_KEY missing — cannot call LLM")
+                reply = "The AI backend is not configured yet. The GEMINI_API_KEY environment variable needs to be set on the server."
+            else:
+                logger.warning("ConversationalAgent: Gemini returned empty (rate limit or transient error)")
+                reply = "I'm having trouble reaching the AI right now. Please try again in a moment."
 
         return {
             "conversational_reply": reply,
