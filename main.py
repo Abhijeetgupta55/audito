@@ -130,25 +130,81 @@ class RecommendProductsRequest(BaseModel):
 
 @app.get("/test-gemini")
 async def test_gemini():
-    """Diagnostic endpoint — tests raw Gemini connectivity in isolation."""
-    from backend.agents import _ensure_gemini, _agenerate
+    """Diagnostic endpoint — tests raw Gemini connectivity in isolation.
+
+    Bypasses _agenerate and calls the SDK directly so we can see the raw response.
+    This isolates whether the issue is in our extraction logic or in the API itself.
+    """
+    from backend.agents import _ensure_gemini
+
     key_set = bool(settings.GEMINI_API_KEY)
     if not key_set:
         return {"status": "error", "reason": "GEMINI_API_KEY not set on this server"}
     client_ok = _ensure_gemini()
     if not client_ok:
         return {"status": "error", "reason": "Gemini client failed to initialize (key may be invalid)"}
+
+    # Re-import _client after _ensure_gemini to get the populated singleton
+    from backend.agents import _client as gemini_client
+
     try:
-        result = await _agenerate(["Say hello in exactly 5 words."], max_tokens=30, retries=1)
-        if result:
-            return {"status": "ok", "model": settings.GEMINI_MODEL, "response": result}
+        # Direct SDK call — minimal config, no max_tokens, no safety settings.
+        # If this works, the issue was in our wrapper. If this fails, it's the API/key.
+        response = gemini_client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents="Say hello in exactly 5 words.",
+        )
+
+        # Try the canonical response.text first
+        direct_text = None
+        try:
+            direct_text = response.text
+        except Exception as e:
+            logger.warning(f"/test-gemini: response.text raised: {e}")
+
+        # Also collect diagnostic info
+        candidates = getattr(response, "candidates", None) or []
+        candidate_count = len(candidates)
+        finish_reason = "N/A"
+        if candidates:
+            fr = getattr(candidates[0], "finish_reason", None)
+            finish_reason = str(fr) if fr is not None else "None"
+
+        usage = getattr(response, "usage_metadata", None)
+        token_info = {}
+        if usage:
+            token_info = {
+                "input_tokens": getattr(usage, "prompt_token_count", None),
+                "output_tokens": getattr(usage, "candidates_token_count", None),
+                "thought_tokens": getattr(usage, "thoughts_token_count", None),
+            }
+
+        if direct_text and direct_text.strip():
+            return {
+                "status": "ok",
+                "model": settings.GEMINI_MODEL,
+                "response": direct_text,
+                "candidate_count": candidate_count,
+                "finish_reason": finish_reason,
+                "tokens": token_info,
+            }
+
         return {
             "status": "error",
-            "reason": "Gemini returned empty response — check Render logs for finish_reason",
+            "reason": "Gemini returned response but extracted text is empty",
             "model": settings.GEMINI_MODEL,
+            "candidate_count": candidate_count,
+            "finish_reason": finish_reason,
+            "tokens": token_info,
+            "raw_response_preview": repr(response)[:500],
         }
     except Exception as e:
-        return {"status": "error", "reason": str(e), "model": settings.GEMINI_MODEL}
+        return {
+            "status": "error",
+            "reason": str(e),
+            "exception_type": type(e).__name__,
+            "model": settings.GEMINI_MODEL,
+        }
 
 
 @app.get("/health")

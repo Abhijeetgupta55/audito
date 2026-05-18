@@ -50,8 +50,11 @@ _SAFETY_OFF = [
 def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
     """
     Parse a Gemini response into (text, finish_reason, safety_info).
-    Never assumes response.text exists — walks candidates/parts directly.
-    Also logs token usage, finish_reason, safety ratings, and blocked reasons.
+    Uses multiple extraction strategies in order of reliability:
+      1. response.text shortcut (canonical SDK method — handles all cases)
+      2. Walk candidates[0].content.parts (manual fallback)
+      3. response.parsed (for structured output)
+    Comprehensive logging on empty responses so we can debug what Gemini returned.
     """
     text = ""
     finish_reason = "UNKNOWN"
@@ -66,10 +69,22 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
                 logger.warning(f"[{model_name}] Prompt blocked — block_reason={block_reason}")
                 return "", f"PROMPT_BLOCKED:{block_reason}", ""
 
+        # Strategy 1: response.text — the canonical SDK shortcut.
+        # This is what every basic wrapper uses; it handles parts walking internally.
+        try:
+            direct = getattr(response, "text", None)
+            if direct and isinstance(direct, str) and direct.strip():
+                text = direct
+        except Exception as e:
+            logger.debug(f"[{model_name}] response.text raised: {e}")
+
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
-            logger.warning(f"[{model_name}] Response has no candidates")
-            return "", "NO_CANDIDATES", ""
+            logger.error(
+                f"[{model_name}] NO_CANDIDATES — response has zero candidates. "
+                f"Full response: {repr(response)[:800]}"
+            )
+            return text, "NO_CANDIDATES", ""
 
         candidate = candidates[0]
 
@@ -77,7 +92,7 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
         raw_fr = getattr(candidate, "finish_reason", None)
         finish_reason = str(raw_fr) if raw_fr is not None else "None"
 
-        # Safety ratings — enumerate enum names safely
+        # Safety ratings
         safety_ratings = getattr(candidate, "safety_ratings", None) or []
         if safety_ratings:
             parts_sr = []
@@ -89,7 +104,7 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
                 parts_sr.append(f"{cat_str}={prob_str}")
             safety_info = " | ".join(parts_sr)
 
-        # Log unexpected finish reasons (not STOP / not thought)
+        # Log unexpected finish reasons
         stop_values = {"FinishReason.STOP", "STOP", "1", "None", "FINISH_REASON_STOP"}
         if finish_reason not in stop_values:
             logger.warning(
@@ -97,16 +112,16 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
                 f"safety=[{safety_info}]"
             )
 
-        # Walk content parts — skip thought parts (present in 2.5 when budget>0)
-        content = getattr(candidate, "content", None)
-        if content:
-            for part in (getattr(content, "parts", None) or []):
-                # gemini-2.5: thought parts carry thought=True attribute
-                if getattr(part, "thought", False):
-                    continue
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    text += part_text
+        # Strategy 2: walk parts manually if response.text didn't give us anything
+        if not text:
+            content = getattr(candidate, "content", None)
+            if content:
+                for part in (getattr(content, "parts", None) or []):
+                    if getattr(part, "thought", False):
+                        continue
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        text += part_text
 
         # Token usage
         usage = getattr(response, "usage_metadata", None)
@@ -116,6 +131,14 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
             thought_tok = getattr(usage, "thoughts_token_count", None) or 0
             logger.info(
                 f"[{model_name}] tokens in={in_tok} out={out_tok} thought={thought_tok}"
+            )
+
+        # If still empty after both strategies, dump the candidate for diagnosis
+        if not text:
+            logger.error(
+                f"[{model_name}] EXTRACTED EMPTY TEXT after both strategies. "
+                f"finish={finish_reason} safety=[{safety_info}] "
+                f"candidate={repr(candidate)[:600]}"
             )
 
     except Exception as exc:
@@ -140,12 +163,12 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
     try:
         cfg_kwargs: Dict[str, Any] = {
             "safety_settings": _SAFETY_OFF,
-            "max_output_tokens": max_tokens,
         }
-        # Removed: thinking_budget=0 on gemini-2.5 text models.
-        # That config caused responses with only thought parts (which we skip),
-        # making _generate return empty strings repeatedly and breaking the pipeline.
-        # Letting the model use its default thinking budget produces reliable output.
+        # Only set max_output_tokens if a real value is provided.
+        # Passing None to GenerateContentConfig can cause SDK validation issues
+        # in newer google-genai versions.
+        if max_tokens is not None and max_tokens > 0:
+            cfg_kwargs["max_output_tokens"] = max_tokens
 
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
@@ -167,14 +190,19 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
 
     except Exception as e:
         err = str(e)
-        if "429" in err:
-            logger.warning(f"_generate: 429 rate-limited [{name}]")
+        # Log the FULL exception type and message so we can see what's actually failing
+        logger.error(
+            f"_generate: exception caught | model={name} | "
+            f"type={type(e).__name__} | message={err[:500]}"
+        )
+        if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+            logger.warning(f"_generate: 429/quota — Google is rate-limiting key")
         elif "404" in err or "not found" in err.lower():
-            logger.error(f"_generate: 404 model not found '{name}' — {err[:300]}")
-        elif "403" in err or "api key" in err.lower() or "permission" in err.lower():
-            logger.error(f"_generate: auth error — verify GEMINI_API_KEY — {err[:300]}")
-        else:
-            logger.error(f"_generate: exception [{name}]: {err[:300]}")
+            logger.error(f"_generate: 404 model '{name}' not found — verify model name")
+        elif "403" in err or "PERMISSION" in err or "API key" in err.lower():
+            logger.error(f"_generate: auth error — verify GEMINI_API_KEY is valid")
+        elif "INVALID_ARGUMENT" in err or "400" in err:
+            logger.error(f"_generate: bad request — check prompt/config format")
         return ""
 
 
