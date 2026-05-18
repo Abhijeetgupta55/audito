@@ -73,7 +73,8 @@ class ChatResponse(BaseModel):
     concern: str
     severity: str = "mild"
     diagnosis: str            # clinical assessment text
-    recommendation: str       # final assembled response shown to user
+    ingredient_rationale: str = ""   # which actives to use and why
+    recommendation: str       # per-product rationale
     products: list
     show_products: bool
     agent_path: list
@@ -166,6 +167,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             concern=state.identified_concern or "none",
             severity=state.severity,
             diagnosis=state.diagnosis,
+            ingredient_rationale=state.ingredient_rationale,
             recommendation=state.recommendation_text or state.conversational_reply,
             products=products_out,
             show_products=state.show_products,
@@ -255,6 +257,7 @@ async def analyze_image(
             "identified_concern": state.identified_concern,
             "severity": state.severity,
             "diagnosis": state.diagnosis,
+            "ingredient_rationale": state.ingredient_rationale,
             "recommendation": state.recommendation_text or state.conversational_reply,
             "products": state.recommended_products,
             "show_products": state.show_products,

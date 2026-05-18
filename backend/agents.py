@@ -136,7 +136,8 @@ class AgentState:
     kb_context: str = ""
     retrieved_products: List[Dict[str, Any]] = field(default_factory=list)
     recommended_products: List[Dict[str, Any]] = field(default_factory=list)
-    recommendation_text: str = ""
+    ingredient_rationale: str = ""   # which actives to use and why (from KB)
+    recommendation_text: str = ""    # per-product clinical rationale
 
     # Conversational (chit-chat / non-concern)
     conversational_reply: str = ""
@@ -725,18 +726,20 @@ class ProductSearchAgent:
 # ---------------------------------------------------------------------------
 
 class RecommendationAgent:
-    SYSTEM = """You are a clinical dermatology assistant writing structured product recommendations.
+    SYSTEM = """You are a clinical dermatology assistant. Structure your response using EXACTLY these two section headers on their own lines:
 
-Format each product as: [Product name] — [key active ingredient] works by [mechanism], addressing [specific observation from this patient's case]. One sentence per product, two if a usage note is needed.
+INGREDIENTS:
+Write a flowing, reasoned paragraph explaining which active ingredients are most appropriate for this specific skin condition and why. Name the condition observed, then introduce each active with its mechanism from the Dermatology Knowledge Base. Connect the ingredient to a visible sign (e.g. "aging is present so retinol is preferred — it directly stimulates collagen synthesis and accelerates cell turnover"). 3-6 sentences, conversational but precise. Do not use bullet points.
 
-Rules:
-- No introductory sentences ("Based on your...", "I recommend...", "These products will...").
+PRODUCTS:
+For each product write one sentence: [Product name] — [key active] works by [mechanism], addressing [specific observation from this patient's case]. Add a second sentence only for an important usage note. After the last product, add one plain caution note (ingredient interactions, sun sensitivity, or patch testing).
+
+Rules that apply to both sections:
+- No intro openers ("Based on your...", "I recommend...", "These products will...").
 - No marketing language ("powerful", "clinically proven", "revolutionary", "amazing").
-- Ground every mechanism claim in the Dermatology Knowledge Base context provided.
-- ONLY reference products from the list — never invent names.
-- Close with one plain-language caution note (e.g. ingredient interactions, sun sensitivity, or patch testing recommendation).
-- Do NOT repeat the diagnosis — it was already shown.
-- If the patient's concern is general/exploratory, focus on foundational actives (cleanser → moisturizer → SPF) before recommending targeted treatments."""
+- Ground every claim in the Dermatology Knowledge Base context provided.
+- ONLY reference products from the provided list — never invent product names.
+- Do NOT repeat the clinical diagnosis — it was already shown to the patient."""
 
     async def process(self, state: AgentState) -> Dict[str, Any]:
         logger.info("Recommendation Agent running")
@@ -748,6 +751,7 @@ Rules:
                 "Please describe your concern in more detail, or consult a dermatologist for personalised advice."
             )
             return {
+                "ingredient_rationale": "",
                 "recommendation_text": text,
                 "recommended_products": [],
                 "show_products": False,
@@ -764,7 +768,7 @@ Rules:
 
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
 
-        rec_text = ""
+        raw_text = ""
         if _ensure_gemini():
             try:
                 user_ctx = (
@@ -773,14 +777,27 @@ Rules:
                     f"Dermatology Knowledge Context:\n{state.kb_context}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                rec_text = _generate([self.SYSTEM, user_ctx], max_tokens=700).strip()
+                raw_text = _generate([self.SYSTEM, user_ctx], max_tokens=900).strip()
             except Exception as e:
                 logger.error(f"Recommendation LLM failed: {e}")
 
-        if not rec_text:
+        # Parse INGREDIENTS: / PRODUCTS: sections
+        ingredient_rationale = ""
+        rec_text = ""
+        if "INGREDIENTS:" in raw_text and "PRODUCTS:" in raw_text:
+            parts = raw_text.split("PRODUCTS:", 1)
+            ingredient_rationale = parts[0].replace("INGREDIENTS:", "").strip()
+            rec_text = parts[1].strip()
+        elif "INGREDIENTS:" in raw_text:
+            ingredient_rationale = raw_text.replace("INGREDIENTS:", "").strip()
+        elif raw_text:
+            rec_text = raw_text
+
+        if not rec_text and not ingredient_rationale:
             rec_text = "Matched products from the database for your concern are shown below."
 
         return {
+            "ingredient_rationale": ingredient_rationale,
             "recommendation_text": rec_text,
             "recommended_products": products[:3],
             "show_products": True,

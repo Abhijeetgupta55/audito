@@ -64,6 +64,20 @@ const DiagnosisCard = ({ text, isQuestion }) => {
   );
 };
 
+const IngredientRationaleCard = ({ text }) => {
+  if (!text) return null;
+  return (
+    <div className="ingredient-rationale-card">
+      <div className="ingredient-rationale-label">
+        <span className="ingredient-rationale-icon">⚗️</span>
+        Why these ingredients
+        <span className="ingredient-rationale-source">from dermatology KB</span>
+      </div>
+      <p className="ingredient-rationale-body">{text}</p>
+    </div>
+  );
+};
+
 const ProductCard = ({ product }) => (
   <div className="product-card">
     <div className="product-card-header">
@@ -226,7 +240,7 @@ const IMAGE_STAGES = [
   'Extracting skin observations…',
   'Checking diagnosis…',
   'Searching product database…',
-  'Retrieving dermatology context…',
+  'Identifying active ingredients from KB…',
   'Generating grounded recommendation…',
 ];
 
@@ -329,6 +343,7 @@ export default function Consultation() {
           concern: data.identified_concern,
           severity: data.severity,
           diagnosis: data.diagnosis,
+          ingredientRationale: data.ingredient_rationale || '',
           recommendation: data.recommendation,
           skinAnalysis: data.skin_analysis,
           progressReport: data.progress_report,
@@ -369,6 +384,7 @@ export default function Consultation() {
           concern: data.concern,
           severity: data.severity,
           diagnosis: data.diagnosis,
+          ingredientRationale: data.ingredient_rationale || '',
           recommendation: data.recommendation,
           products: data.show_products ? (data.products || []) : [],
           warnings: data.warnings || [],
@@ -448,6 +464,9 @@ export default function Consultation() {
                       text={msg.diagnosis}
                       isQuestion={msg.isIntakeQuestion}
                     />
+                  )}
+                  {msg.ingredientRationale && !msg.isIntakeQuestion && (
+                    <IngredientRationaleCard text={msg.ingredientRationale} />
                   )}
                   {msg.recommendation && (
                     <div className="text-bubble">
