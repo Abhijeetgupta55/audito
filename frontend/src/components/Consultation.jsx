@@ -415,11 +415,11 @@ export default function Consultation() {
 
         const isIntake = !data.recommendation && !!data.diagnosis &&
           (data.agent_path || []).slice(-1)[0] === 'diagnosis';
-        // CTA shown whenever a real concern was identified — not gated on actives existing
         const hasConcern = !isIntake && !!(
           data.identified_concern &&
           data.identified_concern !== 'none' &&
-          data.identified_concern !== 'unclear_image'
+          data.identified_concern !== 'unclear_image' &&
+          data.identified_concern !== 'vision_error'
         );
 
         const stage2Payload = hasConcern ? {
@@ -434,7 +434,9 @@ export default function Consultation() {
           skin_analysis: data.skin_analysis || null,
         } : null;
 
+        const msgId = Date.now() + Math.random();
         addMsg({
+          id: msgId,
           role: 'assistant',
           type: 'response',
           content: data.diagnosis || 'Analysis complete.',
@@ -458,6 +460,11 @@ export default function Consultation() {
           stage2Loading: false,
           stage2Data: stage2Payload,
         });
+
+        // Auto-trigger stage2 — no button click needed
+        if (hasConcern && stage2Payload) {
+          handleGetProducts(msgId, stage2Payload);
+        }
 
       } catch (err) {
         console.error('[Audito] /api/analyze-image error:', err?.response?.status, err?.message, err?.response?.data);

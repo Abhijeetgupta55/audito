@@ -72,11 +72,14 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
     prompt_preview = str(prompt_parts[0])[:80] if prompt_parts else ""
     logger.info(f"_generate → model={name} preview={prompt_preview!r}")
     try:
-        cfg = genai_types.GenerateContentConfig(
-            safety_settings=_SAFETY_OFF,
-            max_output_tokens=max_tokens,
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-        )
+        cfg_kwargs: Dict[str, Any] = {
+            "safety_settings": _SAFETY_OFF,
+            "max_output_tokens": max_tokens,
+        }
+        # thinking_budget=0 (disable thinking) is only valid on gemini-2.5+ models
+        if "2.5" in name:
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+        cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
             model=name,
             contents=prompt_parts,

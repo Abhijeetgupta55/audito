@@ -294,7 +294,7 @@ async def analyze_image(
 
         # ── Background: precompute product search for stage2 ──────────────────
         session_key = str(uuid.uuid4())
-        if state.identified_concern and state.identified_concern not in ("none", "unclear_image", ""):
+        if state.identified_concern and state.identified_concern not in ("none", "unclear_image", "vision_error", ""):
             background_tasks.add_task(
                 _prefetch_products,
                 session_key=session_key,
