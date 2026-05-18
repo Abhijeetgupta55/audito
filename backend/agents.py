@@ -364,7 +364,34 @@ Respond ONLY in valid JSON:
                 mime_type=state.image_type or "image/jpeg",
             )
             text = _generate([self.SYSTEM, img_part], model_name=settings.GEMINI_VISION_MODEL, max_tokens=800)
+            logger.info(f"Vision raw response: {len(text)} chars — preview: {text[:120]!r}")
+
+            # Step 1: check if model returned anything at all
+            if not text:
+                logger.error("Vision: _generate returned empty — model/API failure, NOT a photo quality issue")
+                return {
+                    "skin_analysis": {"is_clear": False, "metrics": {}},
+                    "vision_feedback": "Vision analysis temporarily unavailable. Please try again in a moment.",
+                    "identified_concern": "vision_error",
+                    "current_agent": "conversational",
+                    "agent_history": state.agent_history + ["vision"],
+                }
+
+            # Step 2: parse JSON
             analysis = _parse_json(text)
+            logger.info(f"Vision parsed JSON keys: {list(analysis.keys()) if analysis else '(empty)'}")
+
+            # Step 3: check if parsing yielded anything useful
+            if not analysis:
+                logger.error("Vision: JSON parse failed — model responded but output was unparseable")
+                return {
+                    "skin_analysis": {"is_clear": False, "metrics": {}},
+                    "vision_feedback": "Could not interpret the model response. Please try again.",
+                    "identified_concern": "vision_error",
+                    "current_agent": "conversational",
+                    "agent_history": state.agent_history + ["vision"],
+                }
+
             confidence = float((analysis.get("metrics") or {}).get("confidence_score", 0.5) or 0.5)
             logger.info(f"Vision analysis: is_clear={analysis.get('is_clear')} confidence={confidence:.2f}")
 
@@ -374,17 +401,6 @@ Respond ONLY in valid JSON:
                 (analysis.get("conditions") and len(analysis["conditions"]) > 0) or
                 analysis.get("skin_type", "unknown") != "unknown"
             )
-
-            if not analysis:
-                # JSON parse completely failed — nothing to work with
-                logger.warning("Vision: JSON parse empty — routing to conversational")
-                return {
-                    "skin_analysis": {"is_clear": False, "metrics": {}},
-                    "vision_feedback": "The photo could not be read. Please try again with better lighting.",
-                    "identified_concern": "unclear_image",
-                    "current_agent": "conversational",
-                    "agent_history": state.agent_history + ["vision"],
-                }
 
             if analysis.get("is_clear") is False:
                 if has_content:
@@ -682,16 +698,21 @@ Style: direct, conversational, no filler phrases. Match the energy of the messag
     async def process(self, state: AgentState) -> Dict[str, Any]:
         logger.info("Conversational Agent running")
 
-        # Unclear image — give retake guidance
+        # Vision pipeline routed here — distinguish model failure from actual unclear photo
         if state.vision_feedback:
-            reply = (
-                f"I wasn't able to get a clear enough reading from your photo. {state.vision_feedback}\n\n"
-                "For an accurate analysis, please retake the photo:\n"
-                "• In natural daylight or bright indoor light (no flash)\n"
-                "• Hold steady — no blur\n"
-                "• Affected area clearly centred in frame\n"
-                "• No heavy filters or editing"
-            )
+            if state.identified_concern == "vision_error":
+                # Model/API failure — photo was fine, backend couldn't process it
+                reply = state.vision_feedback
+            else:
+                # Genuinely unclear/unusable photo — guide user to retake
+                reply = (
+                    f"I wasn't able to get a clear enough reading from your photo. {state.vision_feedback}\n\n"
+                    "For an accurate analysis, please retake the photo:\n"
+                    "• In natural daylight or bright indoor light (no flash)\n"
+                    "• Hold steady — no blur\n"
+                    "• Affected area clearly centred in frame\n"
+                    "• No heavy filters or editing"
+                )
             return {
                 "conversational_reply": reply,
                 "final_response": reply,
@@ -739,7 +760,7 @@ class ProductSearchAgent:
         logger.info(f"Product Search Agent running (stage={state.stage})")
 
         # Guard: skip if no real concern
-        if not state.identified_concern or state.identified_concern in ("none", "unclear_image", ""):
+        if not state.identified_concern or state.identified_concern in ("none", "unclear_image", "vision_error", ""):
             logger.info("No concern identified — skipping product search")
             return {
                 "retrieved_products": [],

@@ -43,8 +43,8 @@ class Settings:
 
     # Gemini API (via google-generativeai SDK)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    GEMINI_VISION_MODEL: str = os.getenv("GEMINI_VISION_MODEL", "gemini-3.1-flash-lite")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GEMINI_VISION_MODEL: str = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
 
     # These are kept for backwards-compat with any lingering references
     OPENAI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
