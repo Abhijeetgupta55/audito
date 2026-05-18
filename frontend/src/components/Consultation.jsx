@@ -405,8 +405,10 @@ export default function Consultation() {
       form.append('file', file);
       if (text) form.append('message', text);
 
+      const imageUrl = `${API}/api/analyze-image`;
+      console.debug('[Audito] POST', imageUrl);
       try {
-        const { data } = await axios.post(`${API}/api/analyze-image`, form, {
+        const { data } = await axios.post(imageUrl, form, {
           headers: { 'Content-Type': 'multipart/form-data' },
           timeout: 90000,
         });
@@ -458,9 +460,10 @@ export default function Consultation() {
         });
 
       } catch (err) {
+        console.error('[Audito] /api/analyze-image error:', err?.response?.status, err?.message, err?.response?.data);
         const msg = err.code === 'ECONNABORTED'
           ? 'Analysis timed out. Please try again — the model may need a moment to warm up.'
-          : `Could not process the image. ${err.response?.data?.detail || 'Please ensure the photo is clear and well-lit.'}`;
+          : `Could not process the image. ${err.response?.data?.detail || err.message || 'Please ensure the photo is clear and well-lit.'}`;
         addMsg({ role: 'assistant', type: 'text', content: msg });
       } finally {
         setLoading(false);
@@ -470,8 +473,10 @@ export default function Consultation() {
       addMsg({ role: 'user', type: 'text', content: text });
       const updatedHistory = [...conversationHistory, { role: 'user', content: text }];
 
+      const chatUrl = `${API}/api/chat`;
+      console.debug('[Audito] POST', chatUrl);
       try {
-        const { data } = await axios.post(`${API}/api/chat`, {
+        const { data } = await axios.post(chatUrl, {
           message: text,
           conversation_history: updatedHistory,
         }, { timeout: 90000 });
@@ -501,9 +506,10 @@ export default function Consultation() {
         setConversationHistory([...updatedHistory, { role: 'assistant', content: assistantContent }]);
 
       } catch (err) {
+        console.error('[Audito] /api/chat error:', err?.response?.status, err?.message, err?.response?.data);
         const msg = err.code === 'ECONNABORTED'
           ? 'Request timed out. Please try again.'
-          : `Something went wrong. ${err.response?.data?.detail || 'Please try again.'}`;
+          : `Something went wrong. ${err.response?.data?.detail || err.message || 'Please try again.'}`;
         addMsg({ role: 'assistant', type: 'text', content: msg });
       } finally {
         setLoading(false);

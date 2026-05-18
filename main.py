@@ -12,7 +12,7 @@ import uuid
 # TTL=300s. Cache misses just fall through to a fresh product search.
 _reco_cache: Dict[str, Dict] = {}
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -55,6 +55,15 @@ if settings.LANGFUSE_ENABLED:
     setup_langfuse(settings.LANGFUSE_PUBLIC_KEY, settings.LANGFUSE_SECRET_KEY)
 
 evals = EvaluationMetrics()
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every inbound request immediately — before any route logic runs."""
+    logger.info(f"→ {request.method} {request.url.path}")
+    response = await call_next(request)
+    logger.info(f"← {response.status_code} {request.url.path}")
+    return response
 
 
 # ============================================================================
