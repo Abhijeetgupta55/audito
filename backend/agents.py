@@ -10,6 +10,7 @@ Agent routing:
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
@@ -27,16 +28,50 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _client: Optional["genai.Client"] = None
+_api_keys: List[str] = []
+_key_index: int = 0
+
+
+def _load_api_keys() -> List[str]:
+    # GEMINI_API_KEYS (comma-separated) takes precedence; falls back to single GEMINI_API_KEY
+    multi = os.getenv("GEMINI_API_KEYS", "").strip()
+    if multi:
+        keys = [k.strip() for k in multi.split(",") if k.strip()]
+        logger.info(f"_load_api_keys: loaded {len(keys)} keys from GEMINI_API_KEYS")
+        return keys
+    single = settings.GEMINI_API_KEY
+    if single:
+        logger.info("_load_api_keys: loaded 1 key from GEMINI_API_KEY (add GEMINI_API_KEYS for rotation)")
+    return [single] if single else []
+
+
+def get_key_stats() -> dict:
+    """Return current key rotation state — used by /health endpoint."""
+    return {"total_keys": len(_api_keys), "current_key_index": _key_index + 1}
 
 
 def _ensure_gemini() -> bool:
-    global _client
+    global _client, _api_keys, _key_index
+    if not _api_keys:
+        _api_keys = _load_api_keys()
+    if not _api_keys:
+        logger.error("GEMINI_API_KEY is not set — all LLM calls will be skipped. Set this env var on Render.")
+        return False
     if _client is None:
-        if not settings.GEMINI_API_KEY:
-            logger.error("GEMINI_API_KEY is not set — all LLM calls will be skipped. Set this env var on Render.")
-            return False
-        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    return _client is not None
+        _client = genai.Client(api_key=_api_keys[_key_index])
+    return True
+
+
+def _rotate_key() -> bool:
+    """Switch to the next API key when the current one hits quota. Returns True if rotated."""
+    global _client, _api_keys, _key_index
+    if len(_api_keys) <= 1:
+        logger.warning("_rotate_key: only one API key configured — add more via GEMINI_API_KEYS")
+        return False
+    _key_index = (_key_index + 1) % len(_api_keys)
+    _client = genai.Client(api_key=_api_keys[_key_index])
+    logger.warning(f"_rotate_key: quota hit — switched to key {_key_index + 1}/{len(_api_keys)}")
+    return True
 
 
 _SAFETY_OFF = [
@@ -142,8 +177,11 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
             "safety_settings": _SAFETY_OFF,
             "max_output_tokens": max_tokens,
         }
-        # thinking_budget=0 disables extended thinking — only valid on gemini-2.5+ models
-        if "2.5" in name:
+        # thinking_budget=0 disables extended thinking — only valid on gemini-2.5+ text models.
+        # Skip for multimodal prompts (any non-string part = image): 2.5-flash returns empty
+        # responses when thinking is disabled on vision inputs.
+        has_image = any(not isinstance(p, str) for p in prompt_parts)
+        if "2.5" in name and not has_image:
             cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
 
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
@@ -167,7 +205,8 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
     except Exception as e:
         err = str(e)
         if "429" in err:
-            logger.warning(f"_generate: 429 rate-limited [{name}]")
+            logger.warning(f"_generate: 429 quota hit [{name}]")
+            _rotate_key()
         elif "404" in err or "not found" in err.lower():
             logger.error(f"_generate: 404 model not found '{name}' — {err[:300]}")
         elif "403" in err or "api key" in err.lower() or "permission" in err.lower():

@@ -1,6 +1,6 @@
 # Audito — AI Skin & Hair Diagnostic Assistant
 
-Audito is a personal skin and hair health tracker powered by a multi-agent AI pipeline. You describe a concern or upload a photo, and the system runs it through a sequence of specialised AI agents — triage, vision analysis, clinical diagnosis, knowledge-base retrieval, and ingredient recommendation — before returning a structured, actionable response. It is not a replacement for a dermatologist, but it gives you the kind of grounded, specific feedback that generic search results never do.
+Audito is a personal skin and hair health tracker powered by a multi agent AI pipeline. You describe a concern or upload a photo, and the system runs it through a sequence of specialised AI agents — triage, vision analysis, clinical diagnosis, knowledge base retrieval, and ingredient recommendation, before returning a structured, actionable response. It is not a replacement for a dermatologist, but it gives you the kind of grounded, specific feedback that generic search results never do.
 
 ---
 
@@ -34,7 +34,7 @@ Audito is a personal skin and hair health tracker powered by a multi-agent AI pi
 
 ```
 audito/
-├── main.py                    # FastAPI app, all API endpoints
+├── main.py                    
 ├── backend/
 │   ├── agents.py              # All 8 agents + orchestrator + Gemini integration layer
 │   ├── config.py              # Settings loaded from environment variables
@@ -57,7 +57,7 @@ audito/
 │   │   └── main.jsx
 │   ├── .env.production        # VITE_API_URL pointing to Render
 │   └── vercel.json            # SPA rewrite rules
-└── .env                       # Local secrets — never committed
+└── .env                     
 ```
 
 ---
@@ -157,7 +157,6 @@ Structured AI responses render as a swipeable card stack (Framer Motion with spr
 | Warning | Severity is severe or `requires_doctor` is true |
 | A few questions | Diagnosis agent needs more info — intake phase |
 
-Cards are built by a pure `buildCards(msg)` function that maps message state to typed card descriptors. Conversational responses (no structured data) fall through to a plain text bubble.
 
 ---
 
@@ -263,6 +262,6 @@ The system is designed to degrade gracefully at every layer rather than fail har
 ## Limitations
 
 - Not a medical device and not a substitute for professional dermatological advice
-- Product database is curated and limited — not every product on the market is covered
+- Product database is curated and limited, not every product on the market is covered
 - Progress tracking resets if the Render instance restarts (ephemeral storage on free tier)
-- Analysis quality depends on photo conditions — frontal, well-lit, in-focus images produce significantly better results
+- Analysis quality depends on photo conditions — frontal, well lit, infocus images produce significantly better results

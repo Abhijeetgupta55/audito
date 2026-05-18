@@ -20,7 +20,7 @@ import uvicorn
 
 from backend.config import settings
 from backend.logging_config import setup_logging, get_logger
-from backend.agents import get_orchestrator
+from backend.agents import get_orchestrator, get_key_stats
 from backend.vector_store import get_pinecone_store
 from backend.evaluations import EvaluationMetrics
 from backend.monitoring import setup_langfuse
@@ -155,12 +155,15 @@ async def test_gemini():
 async def health_check():
     store = await get_pinecone_store()
     gemini_configured = bool(settings.GEMINI_API_KEY)
+    key_stats = get_key_stats()
     return {
         "status": "healthy" if gemini_configured else "degraded",
         "timestamp": datetime.utcnow().isoformat(),
         "products_loaded": len(store.products),
         "model": settings.GEMINI_MODEL,
         "gemini_configured": gemini_configured,
+        "api_keys_loaded": key_stats["total_keys"],
+        "active_key_index": key_stats["current_key_index"],
         "warnings": [] if gemini_configured else ["GEMINI_API_KEY not set — LLM calls will fail"],
     }
 
