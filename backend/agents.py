@@ -142,12 +142,10 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
             "safety_settings": _SAFETY_OFF,
             "max_output_tokens": max_tokens,
         }
-        # thinking_budget=0 disables extended thinking — only valid on gemini-2.5+ text models.
-        # Skip for multimodal prompts (any non-string part = image): 2.5-flash returns empty
-        # responses when thinking is disabled on vision inputs.
-        has_image = any(not isinstance(p, str) for p in prompt_parts)
-        if "2.5" in name and not has_image:
-            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+        # Removed: thinking_budget=0 on gemini-2.5 text models.
+        # That config caused responses with only thought parts (which we skip),
+        # making _generate return empty strings repeatedly and breaking the pipeline.
+        # Letting the model use its default thinking budget produces reliable output.
 
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
@@ -489,10 +487,10 @@ Respond ONLY in valid JSON:
 
             # Step 1: check if model returned anything at all
             if not text:
-                logger.error("Vision: _generate returned empty — model/API failure, NOT a photo quality issue")
+                logger.error("Vision: _generate returned empty — model/API failure")
                 return {
                     "skin_analysis": {"is_clear": False, "metrics": {}},
-                    "vision_feedback": "Vision analysis temporarily unavailable. Please try again in a moment.",
+                    "vision_feedback": "The AI service is currently unavailable (Gemini API quota or connection issue). Please try again later.",
                     "identified_concern": "vision_error",
                     "current_agent": "conversational",
                     "agent_history": state.agent_history + ["vision"],
@@ -504,10 +502,10 @@ Respond ONLY in valid JSON:
 
             # Step 3: check if parsing yielded anything useful
             if not analysis:
-                logger.error("Vision: JSON parse failed — model responded but output was unparseable")
+                logger.error(f"Vision: JSON parse failed — raw response: {text[:200]!r}")
                 return {
                     "skin_analysis": {"is_clear": False, "metrics": {}},
-                    "vision_feedback": "Could not interpret the model response. Please try again.",
+                    "vision_feedback": "The AI service returned an unexpected response format. This usually clears up on retry — please upload the image again.",
                     "identified_concern": "vision_error",
                     "current_agent": "conversational",
                     "agent_history": state.agent_history + ["vision"],
@@ -871,8 +869,8 @@ Style: direct, conversational, no filler phrases. Match the energy of the messag
                 logger.error("ConversationalAgent: GEMINI_API_KEY missing — cannot call LLM")
                 reply = "The AI backend is not configured yet. The GEMINI_API_KEY environment variable needs to be set on the server."
             else:
-                logger.warning("ConversationalAgent: Gemini returned empty (rate limit or transient error)")
-                reply = "I'm having trouble reaching the AI right now. Please try again in a moment."
+                logger.warning("ConversationalAgent: Gemini returned empty (likely daily quota hit on Google AI Studio free tier — resets at midnight Pacific time)")
+                reply = "The AI service has hit its daily free-tier quota and will reset within 24 hours. Please try again later — no other workaround until the quota window resets."
 
         return {
             "conversational_reply": reply,
