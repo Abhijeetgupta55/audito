@@ -137,8 +137,10 @@ class AgentState:
     kb_context: str = ""
     retrieved_products: List[Dict[str, Any]] = field(default_factory=list)
     recommended_products: List[Dict[str, Any]] = field(default_factory=list)
-    ingredient_rationale: str = ""   # which actives to use and why (from KB)
-    recommendation_text: str = ""    # per-product clinical rationale
+    actives: List[Dict[str, str]] = field(default_factory=list)  # [{name, mechanism, target_concern}]
+    ingredient_rationale: str = ""   # text fallback for actives
+    recommendation_text: str = ""    # per-product clinical rationale (text)
+    recommendation_data: Dict[str, Any] = field(default_factory=dict)  # structured product rationale
 
     # Conversational (chit-chat / non-concern)
     conversational_reply: str = ""
@@ -261,8 +263,8 @@ Respond ONLY with valid JSON:
 
         intent = result.get("intent", "unknown")
         concern = result.get("concern", "none")
-        severity = result.get("severity", "mild")
-        requires_doctor = result.get("requires_doctor", False)
+        severity = result.get("severity") or "mild"
+        requires_doctor = bool(result.get("requires_doctor", False))
 
         # Routing
         if state.image_data:
@@ -434,16 +436,26 @@ Respond ONLY in valid JSON:
 }"""
 
     # --- Phase 2: Differential diagnosis ---
-    DIFFERENTIAL_SYSTEM = """You are a clinical dermatologist AI. Output exactly 3 bullet points — no prose, no headers.
+    DIFFERENTIAL_SYSTEM = """You are a clinical dermatologist AI. Output ONLY valid JSON — no prose, no markdown fences.
 
-• [Most likely picture — "consistent with X" or "may represent Y". Add 1 differential if relevant. Flag red flags inline.]
-• [What cannot be confirmed without physical exam — 1 clause.]
-• [Next step — product-based for mild/moderate; dermatologist referral for severe/unclear.]
+{
+  "concerns": ["primary finding in 4-6 words"],
+  "severity": "mild|moderate|severe",
+  "diagnosis_summary": [
+    "consistent with X — differential if relevant",
+    "cannot confirm without physical exam — specific limitation",
+    "next step — product-based or dermatologist referral"
+  ],
+  "cautions": [],
+  "requires_doctor": false
+}
 
 Rules:
-- Exactly 3 bullets, 1 sentence each, no nesting, no JSON
+- diagnosis_summary: exactly 3 strings, 8-15 words each
+- concerns: 1-2 concise items
+- cautions: 0-1 items only
 - Conservative language — never a single definitive diagnosis
-- Total output under 55 words"""
+- requires_doctor: true only for severe presentations"""
 
     def _build_history_text(self, history: list, current_message: str) -> str:
         """Format conversation history into a readable clinical transcript."""
@@ -542,53 +554,61 @@ Rules:
             f"Reported severity: {state.severity}"
         )
 
+        diagnosis_data_parsed: Dict[str, Any] = {}
         try:
-            raw_diff = _generate([self.DIFFERENTIAL_SYSTEM, diff_prompt], max_tokens=200).strip()
-            # Plain text output — store as-is
-            diagnosis_text = raw_diff
-            state.diagnosis_data = {"assessment": raw_diff}
+            raw_diff = _generate([self.DIFFERENTIAL_SYSTEM, diff_prompt], max_tokens=350).strip()
+            if raw_diff:
+                diagnosis_data_parsed = _parse_json(raw_diff)
+                if diagnosis_data_parsed and diagnosis_data_parsed.get("diagnosis_summary"):
+                    diagnosis_text = "\n".join(
+                        f"• {s}" for s in diagnosis_data_parsed["diagnosis_summary"]
+                    )
+                else:
+                    # LLM returned plain text instead of JSON — use as-is
+                    diagnosis_text = raw_diff
+                    diagnosis_data_parsed = {}
+            else:
+                # Rate limited or empty — fall through to fallback below
+                raise ValueError("LLM returned empty (rate limited)")
 
         except Exception as e:
             logger.error(f"Differential diagnosis LLM failed: {e}")
             concern_label = state.identified_concern.replace("_", " ")
             if state.skin_analysis and state.skin_analysis.get("clinical_observation"):
                 conds = ", ".join(state.skin_analysis.get("conditions", []))
-                fallback = (
+                diagnosis_text = (
                     f"• Findings consistent with {conds or concern_label}.\n"
                     "• Extent and severity cannot be confirmed without physical examination.\n"
                     "• Review matched products below; consult a dermatologist for a confirmed diagnosis."
                 )
             else:
-                fallback = (
-                    f"• Description consistent with {concern_label} — duration, location, and associated symptoms needed to narrow further.\n"
+                diagnosis_text = (
+                    f"• Description consistent with {concern_label}.\n"
                     "• Cannot assess severity or rule out differentials without examination.\n"
                     "• Provide more detail or consult a dermatologist for a confirmed diagnosis."
                 )
             return {
-                "diagnosis": fallback,
+                "diagnosis": diagnosis_text,
+                "diagnosis_data": {},
                 "show_products": False,
                 "current_agent": "search" if state.identified_concern else "safety",
                 "agent_history": state.agent_history + ["diagnosis"],
             }
 
         # ── Determine routing ─────────────────────────────────────────────
-        text_lower = diagnosis_text.lower()
+        parsed_severity = diagnosis_data_parsed.get("severity") or state.severity or "mild"
+        parsed_requires_doctor = bool(diagnosis_data_parsed.get("requires_doctor", state.requires_doctor))
 
-        if state.requires_doctor or state.severity == "severe":
+        if parsed_requires_doctor or parsed_severity == "severe":
             next_agent = "doctor_expert"
-        elif any(p in text_lower for p in ["see a dermatologist", "see a gp", "seek medical attention"]):
-            next_agent = "safety"
-            return {
-                "diagnosis": diagnosis_text,
-                "show_products": False,
-                "current_agent": next_agent,
-                "agent_history": state.agent_history + ["diagnosis"],
-            }
         else:
             next_agent = "search"
 
         return {
             "diagnosis": diagnosis_text,
+            "diagnosis_data": diagnosis_data_parsed,
+            "severity": parsed_severity,
+            "requires_doctor": parsed_requires_doctor,
             "current_agent": next_agent,
             "agent_history": state.agent_history + ["diagnosis"],
         }
@@ -744,44 +764,71 @@ class ProductSearchAgent:
 
 class RecommendationAgent:
     # Stage1: ingredient reasoning from KB — no products needed
-    INGREDIENTS_SYSTEM = """You are a clinical dermatology assistant. Output 2-3 bullet points only.
+    INGREDIENTS_SYSTEM = """You are a clinical dermatology assistant. Output ONLY valid JSON.
 
-Each bullet: • [active ingredient] — [mechanism from KB] — [why it addresses this specific concern]
+{
+  "actives": [
+    {
+      "name": "Ingredient Name",
+      "mechanism": "improve collagen turnover",
+      "target_concern": "wrinkles + texture"
+    }
+  ]
+}
 
 Rules:
-- No prose, no headers, no product names, no intro openers
-- Ground every claim in the Knowledge Base context provided
-- Do NOT repeat the clinical diagnosis
-- Total output under 60 words"""
+- 2-4 actives only, grounded in the Knowledge Base provided
+- name: title case ingredient name
+- mechanism: 3-6 words, active verb (improve / reduce / support / boost / inhibit)
+- target_concern: 2-5 words specific to this patient's concern
+- No prose, no markdown, no product names"""
 
     # Stage2: per-product rationale — ingredient reasoning already shown
-    PRODUCTS_SYSTEM = """You are a clinical dermatology assistant. Output one bullet per product, then one caution line.
+    PRODUCTS_SYSTEM = """You are a clinical dermatology assistant. Output ONLY valid JSON.
 
-Each bullet: • **[Product name]** — [key active] → [specific benefit for this patient's concern]
-After the last product: ⚠ [one-line caution — sun sensitivity / interactions / patch test]
+{
+  "product_rationale": [
+    {
+      "product_name": "exact name from list",
+      "key_active": "main active ingredient",
+      "benefit": "specific benefit for this concern"
+    }
+  ],
+  "caution": "one-line caution about sun sensitivity, interactions, or patch testing"
+}
 
 Rules:
-- Max 3 product bullets, no intro sentences, no marketing language
-- Only reference products from the provided list — never invent names
-- Do NOT re-explain ingredient rationale — it was already shown
-- Total output under 80 words"""
+- Max 3 products from the provided list only — never invent names
+- benefit: 4-8 words, specific to this patient's concern
+- caution: one sentence, omit if not applicable
+- Do NOT re-explain ingredient actives — already shown"""
 
     # Full mode: both sections in one pass (used by text/chat pipeline)
-    SYSTEM = """You are a clinical dermatology assistant. Use EXACTLY these two section headers on their own lines:
+    SYSTEM = """You are a clinical dermatology assistant. Output ONLY valid JSON.
 
-INGREDIENTS:
-2-3 bullets. Each: • [active] — [mechanism from KB] — [why it addresses this concern]
-
-PRODUCTS:
-One bullet per product (max 3): • **[Product name]** — [key active] → [specific benefit for this patient]
-After the last product: ⚠ [one-line caution]
+{
+  "actives": [
+    {
+      "name": "Ingredient Name",
+      "mechanism": "improve collagen turnover",
+      "target_concern": "wrinkles + texture"
+    }
+  ],
+  "product_rationale": [
+    {
+      "product_name": "exact name from list",
+      "key_active": "main active",
+      "benefit": "specific benefit for this patient"
+    }
+  ],
+  "caution": "one-line caution"
+}
 
 Rules:
-- No intro openers, no marketing language, no prose paragraphs
-- Ground every claim in the Knowledge Base context provided
-- ONLY reference products from the provided list — never invent names
-- Do NOT repeat the clinical diagnosis
-- Total output under 120 words"""
+- actives: 2-4 items, grounded in Knowledge Base
+- product_rationale: max 3, only from provided list — never invent names
+- caution: one sentence, omit if not applicable
+- No intro, no markdown, no prose paragraphs"""
 
     async def process(self, state: AgentState) -> Dict[str, Any]:
         logger.info(f"Recommendation Agent running (stage={state.stage})")
@@ -794,6 +841,7 @@ Rules:
     # ── Stage 1: ingredient rationale only ───────────────────────────────────
     async def _run_stage1(self, state: AgentState) -> Dict[str, Any]:
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
+        actives: List[Dict[str, str]] = []
         ingredient_rationale = ""
         if _ensure_gemini() and state.kb_context:
             try:
@@ -802,10 +850,18 @@ Rules:
                     f"Clinical observation: {obs or 'N/A'}\n\n"
                     f"Dermatology Knowledge Context:\n{state.kb_context}"
                 )
-                ingredient_rationale = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=180).strip()
+                raw = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=350).strip()
+                parsed = _parse_json(raw)
+                actives = parsed.get("actives", []) if parsed else []
+                if actives:
+                    ingredient_rationale = "\n".join(
+                        f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
+                        for a in actives
+                    )
             except Exception as e:
                 logger.error(f"Stage1 ingredient rationale failed: {e}")
         return {
+            "actives": actives,
             "ingredient_rationale": ingredient_rationale,
             "recommendation_text": "",
             "recommended_products": [],
@@ -819,8 +875,10 @@ Rules:
         products = state.retrieved_products
         if not products:
             return {
+                "actives": state.actives,
                 "ingredient_rationale": state.ingredient_rationale,
-                "recommendation_text": "No matching products were found in our database for this concern.",
+                "recommendation_text": "",
+                "recommendation_data": {},
                 "recommended_products": [],
                 "show_products": False,
                 "current_agent": "safety",
@@ -832,6 +890,7 @@ Rules:
             for p in products[:5]
         ])
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
+        rec_data: Dict[str, Any] = {}
         rec_text = ""
         if _ensure_gemini():
             try:
@@ -841,14 +900,23 @@ Rules:
                     f"Dermatology Knowledge Context:\n{state.kb_context or ''}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                rec_text = _generate([self.PRODUCTS_SYSTEM, ctx], max_tokens=250).strip()
+                raw = _generate([self.PRODUCTS_SYSTEM, ctx], max_tokens=350).strip()
+                rec_data = _parse_json(raw) or {}
+                if rec_data.get("product_rationale"):
+                    lines = [
+                        f"• {pr['product_name']} — {pr.get('key_active', '')} → {pr.get('benefit', '')}"
+                        for pr in rec_data["product_rationale"]
+                    ]
+                    if rec_data.get("caution"):
+                        lines.append(f"⚠ {rec_data['caution']}")
+                    rec_text = "\n".join(lines)
             except Exception as e:
                 logger.error(f"Stage2 product recommendation failed: {e}")
-        if not rec_text:
-            rec_text = "Matched products from the database for your concern are shown below."
         return {
+            "actives": state.actives,
             "ingredient_rationale": state.ingredient_rationale,
             "recommendation_text": rec_text,
+            "recommendation_data": rec_data,
             "recommended_products": products[:3],
             "show_products": True,
             "current_agent": "safety",
@@ -859,13 +927,11 @@ Rules:
     async def _run_full(self, state: AgentState) -> Dict[str, Any]:
         products = state.retrieved_products
         if not products:
-            text = (
-                "I couldn't find specific products in our database matching your concern. "
-                "Please describe your concern in more detail, or consult a dermatologist for personalised advice."
-            )
             return {
+                "actives": [],
                 "ingredient_rationale": "",
-                "recommendation_text": text,
+                "recommendation_text": "I couldn't find specific products in our database matching your concern. Please describe your concern in more detail, or consult a dermatologist for personalised advice.",
+                "recommendation_data": {},
                 "recommended_products": [],
                 "show_products": False,
                 "current_agent": "safety",
@@ -877,7 +943,10 @@ Rules:
             for p in products[:5]
         ])
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
-        raw_text = ""
+        rec_data: Dict[str, Any] = {}
+        actives: List[Dict[str, str]] = []
+        ingredient_rationale = ""
+        rec_text = ""
         if _ensure_gemini():
             try:
                 user_ctx = (
@@ -886,25 +955,29 @@ Rules:
                     f"Dermatology Knowledge Context:\n{state.kb_context}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                raw_text = _generate([self.SYSTEM, user_ctx], max_tokens=350).strip()
+                raw = _generate([self.SYSTEM, user_ctx], max_tokens=450).strip()
+                rec_data = _parse_json(raw) or {}
+                actives = rec_data.get("actives", [])
+                if actives:
+                    ingredient_rationale = "\n".join(
+                        f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
+                        for a in actives
+                    )
+                if rec_data.get("product_rationale"):
+                    lines = [
+                        f"• {pr['product_name']} — {pr.get('key_active', '')} → {pr.get('benefit', '')}"
+                        for pr in rec_data["product_rationale"]
+                    ]
+                    if rec_data.get("caution"):
+                        lines.append(f"⚠ {rec_data['caution']}")
+                    rec_text = "\n".join(lines)
             except Exception as e:
                 logger.error(f"Full recommendation LLM failed: {e}")
-        # Parse INGREDIENTS: / PRODUCTS: sections
-        ingredient_rationale = ""
-        rec_text = ""
-        if "INGREDIENTS:" in raw_text and "PRODUCTS:" in raw_text:
-            parts = raw_text.split("PRODUCTS:", 1)
-            ingredient_rationale = parts[0].replace("INGREDIENTS:", "").strip()
-            rec_text = parts[1].strip()
-        elif "INGREDIENTS:" in raw_text:
-            ingredient_rationale = raw_text.replace("INGREDIENTS:", "").strip()
-        elif raw_text:
-            rec_text = raw_text
-        if not rec_text and not ingredient_rationale:
-            rec_text = "Matched products from the database for your concern are shown below."
         return {
+            "actives": actives,
             "ingredient_rationale": ingredient_rationale,
             "recommendation_text": rec_text,
+            "recommendation_data": rec_data,
             "recommended_products": products[:3],
             "show_products": True,
             "current_agent": "safety",

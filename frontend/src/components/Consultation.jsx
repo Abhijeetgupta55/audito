@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import './Consultation.css';
+import DiagnosticDeck, { buildCards } from './DiagnosticDeck';
 
 const API = import.meta.env.VITE_API_URL || '';
 
@@ -33,8 +34,54 @@ const XIcon = () => (
   </svg>
 );
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// ─── Clinical components ──────────────────────────────────────────────────────
 
+const SkinAnalysisCard = ({ analysis }) => {
+  if (!analysis || !analysis.clinical_observation) return null;
+  return (
+    <div className="skin-analysis-card">
+      <div className="skin-analysis-label"><span>📸</span> Photo Analysis</div>
+      <div className="skin-analysis-row">
+        {analysis.skin_type && analysis.skin_type !== 'unknown' && (
+          <span className="skin-tag">{analysis.skin_type} skin</span>
+        )}
+        {analysis.conditions?.map((c, i) => <span key={i} className="skin-tag">{c}</span>)}
+      </div>
+      <p className="skin-analysis-obs">{analysis.clinical_observation}</p>
+    </div>
+  );
+};
+
+// Structured clinical summary — renders diagnosis_data JSON
+const ClinicalSummaryCard = ({ data, severity }) => {
+  if (!data?.diagnosis_summary?.length) return null;
+  return (
+    <div className="clinical-summary-card">
+      <div className="clinical-summary-header">
+        <span>🔬</span>
+        <span className="clinical-title">Clinical Summary</span>
+        {severity && severity !== 'unknown' && (
+          <span className={`sev-chip sev-chip-${severity}`}>{severity}</span>
+        )}
+        <span className="diag-disclaimer">AI · Not a diagnosis</span>
+      </div>
+      {data.concerns?.length > 0 && (
+        <div className="concern-chips">
+          {data.concerns.map((c, i) => (
+            <span key={i} className="concern-chip">{c}</span>
+          ))}
+        </div>
+      )}
+      <ul className="clinical-bullets">
+        {data.diagnosis_summary.map((item, i) => (
+          <li key={i}>{item}</li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+// Fallback diagnosis card — used when diagnosis is plain text or an intake question
 const DiagnosisCard = ({ text, isQuestion }) => {
   if (!text) return null;
   if (isQuestion) {
@@ -47,33 +94,85 @@ const DiagnosisCard = ({ text, isQuestion }) => {
       </div>
     );
   }
-  const paragraphs = text.split(/\n{2,}/).filter(p => p.trim());
   return (
-    <div className="diagnosis-card">
-      <div className="diagnosis-label">
-        <span className="diagnosis-icon">🔬</span>
-        Clinical Assessment
+    <div className="clinical-summary-card">
+      <div className="clinical-summary-header">
+        <span>🔬</span>
+        <span className="clinical-title">Clinical Summary</span>
         <span className="diag-disclaimer">AI · Not a diagnosis</span>
       </div>
-      <div className="diagnosis-body">
-        {paragraphs.map((para, i) => (
-          <p key={i} className="diag-para">{para.trim()}</p>
+      <ul className="clinical-bullets">
+        {text.split('\n').filter(l => l.trim()).map((l, i) => (
+          <li key={i}>{l.replace(/^[•\-\*]\s*/, '')}</li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+// Recommended actives — the primary visual centerpiece
+const ActivesCard = ({ actives }) => {
+  if (!actives?.length) return null;
+  return (
+    <div className="actives-card">
+      <div className="actives-header">
+        <span className="actives-icon">⚗️</span>
+        <span className="actives-title">Recommended Actives</span>
+        <span className="actives-source">KB-grounded</span>
+      </div>
+      <div className="actives-grid">
+        {actives.map((a, i) => (
+          <div key={i} className="active-item">
+            <span className="active-name">{a.name}</span>
+            <span className="active-arrow">→</span>
+            <span className="active-mechanism">{a.mechanism}</span>
+            <span className="active-arrow">→</span>
+            <span className="active-target">{a.target_concern}</span>
+          </div>
         ))}
       </div>
     </div>
   );
 };
 
+// Legacy ingredient rationale (text fallback when actives array is missing)
 const IngredientRationaleCard = ({ text }) => {
   if (!text) return null;
+  const lines = text.split('\n').filter(l => l.trim());
+  // If it looks structured (bullet lines) render as actives-style
+  const parsed = lines.map(l => {
+    const clean = l.replace(/^[•\-\*]\s*/, '');
+    const parts = clean.split(' — ');
+    if (parts.length >= 3) return { name: parts[0], mechanism: parts[1], target_concern: parts.slice(2).join(' — ') };
+    return null;
+  }).filter(Boolean);
+  if (parsed.length > 0) return <ActivesCard actives={parsed} />;
   return (
     <div className="ingredient-rationale-card">
       <div className="ingredient-rationale-label">
         <span className="ingredient-rationale-icon">⚗️</span>
-        Why these ingredients
+        Recommended Actives
         <span className="ingredient-rationale-source">from dermatology KB</span>
       </div>
       <p className="ingredient-rationale-body">{text}</p>
+    </div>
+  );
+};
+
+// Single-line compact warning banner
+const CompactAlert = ({ severity, warnings, requiresDoctor }) => {
+  let msg = null;
+  if (severity === 'severe') {
+    msg = 'Severe presentation detected — dermatologist consultation recommended.';
+  } else if (requiresDoctor) {
+    msg = 'Professional consultation recommended for this concern.';
+  } else if (warnings?.length) {
+    msg = warnings[0].replace(/^⚠️?\s*/i, '');
+  }
+  if (!msg) return null;
+  return (
+    <div className={`compact-alert${severity === 'severe' ? ' compact-alert-severe' : ''}`}>
+      ⚠ {msg}
     </div>
   );
 };
@@ -100,22 +199,6 @@ const ProductCard = ({ product }) => (
   </div>
 );
 
-const SkinAnalysisCard = ({ analysis }) => {
-  if (!analysis || !analysis.clinical_observation) return null;
-  return (
-    <div className="skin-analysis-card">
-      <div className="skin-analysis-label"><span>📸</span> Photo Analysis</div>
-      <div className="skin-analysis-row">
-        {analysis.skin_type && analysis.skin_type !== 'unknown' && (
-          <span className="skin-tag">{analysis.skin_type} skin</span>
-        )}
-        {analysis.conditions?.map((c, i) => <span key={i} className="skin-tag">{c}</span>)}
-      </div>
-      <p className="skin-analysis-obs">{analysis.clinical_observation}</p>
-    </div>
-  );
-};
-
 const TrendChart = ({ trends }) => {
   if (!trends) return null;
   const keyMetrics = ['acne_severity', 'redness', 'hair_thinning'];
@@ -129,7 +212,6 @@ const TrendChart = ({ trends }) => {
       break;
     }
   }
-
   if (!chartData) {
     const firstKey = Object.keys(trends).find(k => trends[k]?.length >= 2 && trends[k].some(d => d.value > 0));
     if (firstKey) {
@@ -137,10 +219,8 @@ const TrendChart = ({ trends }) => {
       chartTitle = firstKey.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
     }
   }
-
   if (!chartData) return null;
   const maxVal = Math.max(...chartData.map(d => d.value), 10);
-
   return (
     <div className="trend-chart-container">
       <div className="trend-title">{chartTitle} Trend</div>
@@ -158,35 +238,28 @@ const TrendChart = ({ trends }) => {
 
 const ProgressCard = ({ report }) => {
   if (!report) return null;
-
   const hasComparison = !!report.comparison;
   const hasInsights = report.insight_summary?.length > 0;
   const isFirstUpload = !hasComparison && report.records?.length <= 1;
-
   if (!hasComparison && !hasInsights && !isFirstUpload) return null;
-
   return (
     <div className="progress-card">
       <div className="progress-label"><span className="progress-icon">📈</span> Progress Tracking</div>
-
       {isFirstUpload && (
         <div className="progress-first-upload">
-          This is your first recorded upload. Upload again later to track how your skin changes over time.
+          First upload recorded. Upload again later to track changes over time.
         </div>
       )}
-
       {hasComparison && report.comparison.previous_date && (
         <div className="progress-compare-note">
-          Compared to your upload on {report.comparison.previous_date}
+          Compared to {report.comparison.previous_date}
         </div>
       )}
-
       {report.lighting_warning && (
         <div className="progress-warning">
-          <span>⚠️</span> <strong>Note:</strong> Lighting or angle differs from your last upload — comparisons may be less reliable.
+          <span>⚠️</span> Lighting or angle differs from last upload — comparisons may be less reliable.
         </div>
       )}
-
       {hasInsights && (
         <div className="progress-insights">
           {report.insight_summary.map((insight, idx) => (
@@ -194,9 +267,7 @@ const ProgressCard = ({ report }) => {
           ))}
         </div>
       )}
-
       {report.trends && <TrendChart trends={report.trends} />}
-
       {report.comparison?.deltas && (
         <div className="progress-metrics-grid">
           {Object.entries(report.comparison.deltas).map(([key, data]) => {
@@ -221,27 +292,14 @@ const TypingDots = () => (
   </div>
 );
 
-const SeverityBadge = ({ concern, severity }) => {
-  if (!concern || concern === 'none' || concern === 'unclear_image') return null;
-  return (
-    <div className="severity-badge">
-      <span className={`sev-dot sev-${severity}`} />
-      <span>{concern.replace(/_/g, ' ')}</span>
-      {severity && <span className="sev-label">{severity}</span>}
-    </div>
-  );
-};
-
 // ─── Loading stage messages ───────────────────────────────────────────────────
 
 const IMAGE_STAGES = [
   'Uploading photo…',
   'Running vision analysis…',
   'Extracting skin observations…',
-  'Checking diagnosis…',
-  'Searching product database…',
+  'Generating clinical summary…',
   'Identifying active ingredients from KB…',
-  'Generating grounded recommendation…',
 ];
 
 const TEXT_STAGES = [
@@ -257,7 +315,7 @@ const WELCOME = {
   id: 'welcome',
   role: 'assistant',
   type: 'text',
-  content: "Audito — skin & hair health tracker.\n\nDescribe a concern or upload a photo to begin. Each analysis is logged so you can track how your skin and hair metrics change over time across sessions.",
+  content: "Audito — skin & hair health tracker.\n\nDescribe a concern or upload a photo to begin. Each analysis is logged so you can track how your skin and hair metrics change over time.",
 };
 
 // ─── Main Component ───────────────────────────────────────────────────────────
@@ -267,19 +325,17 @@ export default function Consultation() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState('');
-  const [pendingImage, setPendingImage] = useState(null); // { file, previewUrl }
+  const [pendingImage, setPendingImage] = useState(null);
   const [conversationHistory, setConversationHistory] = useState([]);
 
   const fileRef = useRef(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
-  // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading]);
 
-  // Loading stage cycling
   useEffect(() => {
     if (!loading) { setLoadingStage(''); return; }
     const stages = pendingImage ? IMAGE_STAGES : TEXT_STAGES;
@@ -293,6 +349,7 @@ export default function Consultation() {
     setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }]);
   }, []);
 
+  // Stage 2: fetch products when user clicks the button
   const handleGetProducts = useCallback(async (msgId, stage2Data) => {
     setMessages(prev => prev.map(m =>
       m.id === msgId ? { ...m, stage2Loading: true } : m
@@ -304,19 +361,18 @@ export default function Consultation() {
           ...m,
           products: data.products || [],
           recommendation: data.recommendation || '',
+          recommendationData: data.recommendation_data || {},
           show_products: data.show_products,
           stage2Pending: false,
           stage2Loading: false,
         } : m
       ));
-    } catch (err) {
+    } catch {
       setMessages(prev => prev.map(m =>
         m.id === msgId ? { ...m, stage2Loading: false } : m
       ));
     }
   }, []);
-
-  // ── Select image — don't upload yet, just preview ─────────────────────────
 
   const handleImageSelect = (e) => {
     const file = e.target.files?.[0];
@@ -332,8 +388,6 @@ export default function Consultation() {
     setPendingImage(null);
   };
 
-  // ── Unified send — handles text-only and image+text ───────────────────────
-
   const handleSend = async () => {
     const text = input.trim();
     if ((!text && !pendingImage) || loading) return;
@@ -342,7 +396,6 @@ export default function Consultation() {
     setLoading(true);
 
     if (pendingImage) {
-      // ── Image path (with optional context text) ──────────────────────────
       const { file, previewUrl } = pendingImage;
       setPendingImage(null);
 
@@ -358,8 +411,10 @@ export default function Consultation() {
           timeout: 90000,
         });
 
-        const hasIngredients = !!data.ingredient_rationale;
-        const isIntake = !data.recommendation && !!data.diagnosis && (data.agent_path || []).slice(-1)[0] === 'diagnosis';
+        const hasActives = (data.actives || []).length > 0 || !!data.ingredient_rationale;
+        const isIntake = !data.recommendation && !!data.diagnosis &&
+          (data.agent_path || []).slice(-1)[0] === 'diagnosis';
+
         addMsg({
           role: 'assistant',
           type: 'response',
@@ -368,18 +423,20 @@ export default function Consultation() {
           concern: data.identified_concern,
           severity: data.severity,
           diagnosis: data.diagnosis,
+          diagnosisData: data.diagnosis_data || {},
+          actives: data.actives || [],
           ingredientRationale: data.ingredient_rationale || '',
           recommendation: data.recommendation || '',
+          recommendationData: data.recommendation_data || {},
           skinAnalysis: data.skin_analysis,
           progressReport: data.progress_report,
           products: [],
           warnings: data.warnings || [],
           agentPath: data.agent_path || [],
           isIntakeQuestion: isIntake,
-          // Stage 2 deferred product fetch
-          stage2Pending: hasIngredients && !isIntake,
+          stage2Pending: hasActives && !isIntake,
           stage2Loading: false,
-          stage2Data: hasIngredients && !isIntake ? {
+          stage2Data: hasActives && !isIntake ? {
             session_key: data.session_key || null,
             identified_concern: data.identified_concern || '',
             severity: data.severity || 'mild',
@@ -394,7 +451,7 @@ export default function Consultation() {
 
       } catch (err) {
         const msg = err.code === 'ECONNABORTED'
-          ? 'The analysis timed out (server took too long). Please try again — it may be faster on a second attempt once the model is warmed up.'
+          ? 'Analysis timed out. Please try again — the model may need a moment to warm up.'
           : `Could not process the image. ${err.response?.data?.detail || 'Please ensure the photo is clear and well-lit.'}`;
         addMsg({ role: 'assistant', type: 'text', content: msg });
       } finally {
@@ -402,9 +459,7 @@ export default function Consultation() {
       }
 
     } else {
-      // ── Text-only path ───────────────────────────────────────────────────
       addMsg({ role: 'user', type: 'text', content: text });
-
       const updatedHistory = [...conversationHistory, { role: 'user', content: text }];
 
       try {
@@ -423,12 +478,16 @@ export default function Consultation() {
           concern: data.concern,
           severity: data.severity,
           diagnosis: data.diagnosis,
+          diagnosisData: data.diagnosis_data || {},
+          actives: data.actives || [],
           ingredientRationale: data.ingredient_rationale || '',
           recommendation: data.recommendation,
+          recommendationData: data.recommendation_data || {},
           products: data.show_products ? (data.products || []) : [],
           warnings: data.warnings || [],
           agentPath: data.agent_path || [],
-          isIntakeQuestion: !data.recommendation && !!data.diagnosis && (data.agent_path || []).slice(-1)[0] === 'diagnosis',
+          isIntakeQuestion: !data.recommendation && !!data.diagnosis &&
+            (data.agent_path || []).slice(-1)[0] === 'diagnosis',
         });
 
         setConversationHistory([...updatedHistory, { role: 'assistant', content: assistantContent }]);
@@ -453,7 +512,6 @@ export default function Consultation() {
 
   return (
     <div className="app-shell">
-      {/* Header */}
       <header className="app-header">
         <div className="header-left">
           <div className="logo-mark">A</div>
@@ -465,92 +523,55 @@ export default function Consultation() {
         <span className="header-badge">Database-grounded</span>
       </header>
 
-      {/* Chat area */}
       <main className="chat-area">
-        {messages.map((msg) => (
-          <div key={msg.id} className={`msg-row ${msg.role}`}>
-            {msg.role === 'assistant' && <div className="avatar"><BotIcon /></div>}
-            <div className="msg-content">
+        {messages.map((msg) => {
+          const deckCards = msg.type === 'response' ? buildCards(msg) : [];
+          return (
+            <div key={msg.id} className={`msg-row ${msg.role}`}>
+              {msg.role === 'assistant' && <div className="avatar"><BotIcon /></div>}
+              <div className={`msg-content${deckCards.length > 0 ? ' has-deck' : ''}`}>
 
-              {/* Image bubble (user) */}
-              {msg.type === 'image' && (
-                <div className="image-bubble">
-                  <img src={msg.content} alt="uploaded" className="chat-img" />
-                  {msg.caption && <div className="text-bubble img-caption-bubble">{msg.caption}</div>}
-                  <span className="img-filename">{msg.filename}</span>
-                </div>
-              )}
+                {/* Image bubble (user) */}
+                {msg.type === 'image' && (
+                  <div className="image-bubble">
+                    <img src={msg.content} alt="uploaded" className="chat-img" />
+                    {msg.caption && <div className="text-bubble img-caption-bubble">{msg.caption}</div>}
+                    <span className="img-filename">{msg.filename}</span>
+                  </div>
+                )}
 
-              {/* Plain text bubble */}
-              {msg.type === 'text' && (
-                <div className="text-bubble">
-                  {msg.content?.split('\n').map((line, j) => (
-                    <span key={j}>{line}{j < msg.content.split('\n').length - 1 && <br />}</span>
-                  ))}
-                </div>
-              )}
+                {/* Plain text bubble */}
+                {msg.type === 'text' && (
+                  <div className="text-bubble">
+                    {msg.content?.split('\n').map((line, j) => (
+                      <span key={j}>{line}{j < msg.content.split('\n').length - 1 && <br />}</span>
+                    ))}
+                  </div>
+                )}
 
-              {/* Rich assistant response */}
-              {msg.type === 'response' && (
-                <>
-                  {msg.concern && msg.concern !== 'none' && (
-                    <SeverityBadge concern={msg.concern} severity={msg.severity} />
-                  )}
-                  {msg.skinAnalysis && <SkinAnalysisCard analysis={msg.skinAnalysis} />}
-                  {msg.progressReport && <ProgressCard report={msg.progressReport} />}
-                  {msg.diagnosis && (
-                    <DiagnosisCard
-                      text={msg.diagnosis}
-                      isQuestion={msg.isIntakeQuestion}
-                    />
-                  )}
-                  {msg.ingredientRationale && !msg.isIntakeQuestion && (
-                    <IngredientRationaleCard text={msg.ingredientRationale} />
-                  )}
-                  {msg.recommendation && (
+                {/* Structured response — card deck */}
+                {msg.type === 'response' && deckCards.length > 0 && (
+                  <DiagnosticDeck msg={msg} onGetProducts={handleGetProducts} />
+                )}
+
+                {/* Conversational response — plain text bubble */}
+                {msg.type === 'response' && deckCards.length === 0 && (
+                  <>
                     <div className="text-bubble">
-                      {msg.recommendation.split('\n').map((line, j) => (
-                        <span key={j}>{line}{j < msg.recommendation.split('\n').length - 1 && <br />}</span>
+                      {(msg.recommendation || msg.content || '').split('\n').map((line, j, arr) => (
+                        <span key={j}>{line}{j < arr.length - 1 && <br />}</span>
                       ))}
                     </div>
-                  )}
-                  {msg.warnings?.length > 0 && (
-                    <div className="warning-box">
-                      {msg.warnings.map((w, j) => <p key={j}>{w}</p>)}
-                    </div>
-                  )}
-                  {msg.products?.length > 0 && (
-                    <div className="products-section">
-                      <p className="products-label">Recommended from database</p>
-                      <div className="products-grid">
-                        {msg.products.map((p, j) => <ProductCard key={j} product={p} />)}
-                      </div>
-                    </div>
-                  )}
-                  {msg.stage2Loading && (
-                    <div className="stage2-loading">
-                      <TypingDots />
-                      <span className="stage2-loading-text">Finding matching products…</span>
-                    </div>
-                  )}
-                  {msg.stage2Pending && !msg.stage2Loading && (
-                    <button
-                      className="get-products-btn"
-                      onClick={() => handleGetProducts(msg.id, msg.stage2Data)}
-                    >
-                      Get Product Recommendations
-                    </button>
-                  )}
-                  {msg.agentPath?.length > 0 && (
-                    <div className="agent-path">{msg.agentPath.join(' → ')}</div>
-                  )}
-                </>
-              )}
+                    {msg.agentPath?.length > 0 && (
+                      <div className="agent-path">{msg.agentPath.join(' → ')}</div>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
 
-        {/* Loading indicator */}
         {loading && (
           <div className="msg-row assistant">
             <div className="avatar"><BotIcon /></div>
@@ -566,10 +587,7 @@ export default function Consultation() {
         <div ref={bottomRef} />
       </main>
 
-      {/* Input area */}
       <div className="input-bar">
-
-        {/* Pending image preview strip */}
         {pendingImage && (
           <div className="pending-strip">
             <div className="pending-thumb-wrap">
@@ -581,8 +599,6 @@ export default function Consultation() {
             <span className="pending-label">Photo attached — add context below or press send</span>
           </div>
         )}
-
-        {/* Input row */}
         <div className="input-row">
           <input
             type="file"

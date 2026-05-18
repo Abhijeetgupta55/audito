@@ -78,9 +78,12 @@ class ChatResponse(BaseModel):
     intent: str               # "concern" | "chit_chat" | "follow_up" | "unknown"
     concern: str
     severity: str = "mild"
-    diagnosis: str            # clinical assessment text
-    ingredient_rationale: str = ""   # which actives to use and why
-    recommendation: str       # per-product rationale
+    diagnosis: str            # clinical assessment text (fallback)
+    diagnosis_data: dict = {}        # structured diagnosis {concerns, severity, diagnosis_summary, cautions, requires_doctor}
+    ingredient_rationale: str = ""   # text fallback for actives
+    actives: list = []               # structured actives [{name, mechanism, target_concern}]
+    recommendation_data: dict = {}   # structured product rationale {product_rationale[], caution}
+    recommendation: str       # per-product rationale (text fallback)
     products: list
     show_products: bool
     agent_path: list
@@ -184,9 +187,12 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             request_id=request_id,
             intent=state.intent,
             concern=state.identified_concern or "none",
-            severity=state.severity,
+            severity=state.severity or "mild",
             diagnosis=state.diagnosis,
+            diagnosis_data=state.diagnosis_data,
             ingredient_rationale=state.ingredient_rationale,
+            actives=state.actives,
+            recommendation_data=state.recommendation_data,
             recommendation=state.recommendation_text or state.conversational_reply,
             products=products_out,
             show_products=state.show_products,
@@ -282,8 +288,8 @@ async def analyze_image(
 
         return {
             "request_id": request_id,
-            "session_key": session_key,           # for stage2 cache lookup
-            "kb_context": state.kb_context,       # passed back so stage2 can reuse
+            "session_key": session_key,
+            "kb_context": state.kb_context,
             "record_id": record_id,
             "progress_report": progress_data,
             "intent": state.intent,
@@ -291,7 +297,10 @@ async def analyze_image(
             "identified_concern": state.identified_concern,
             "severity": state.severity,
             "diagnosis": state.diagnosis,
+            "diagnosis_data": state.diagnosis_data,
             "ingredient_rationale": state.ingredient_rationale,
+            "actives": state.actives,
+            "recommendation_data": state.recommendation_data,
             "recommendation": state.recommendation_text or state.conversational_reply,
             "products": state.recommended_products,
             "show_products": state.show_products,
@@ -382,6 +391,7 @@ async def recommend_products(request: RecommendProductsRequest):
             "request_id": request_id,
             "products": state.recommended_products,
             "recommendation": state.recommendation_text,
+            "recommendation_data": state.recommendation_data,
             "show_products": state.show_products,
             "agent_path": state.agent_history,
             "latency_ms": state.total_latency_ms,

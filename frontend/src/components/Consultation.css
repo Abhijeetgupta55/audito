@@ -346,6 +346,181 @@ body {
   margin: 0;
 }
 
+/* ── Clinical Summary Card ───────────────────────────────────────────────────── */
+.clinical-summary-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.clinical-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.clinical-title {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sev-chip {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: capitalize;
+  letter-spacing: 0.3px;
+}
+.sev-chip-mild     { background: #E8F5E9; color: #2E7D32; }
+.sev-chip-moderate { background: #FFF3E0; color: #BF360C; }
+.sev-chip-severe   { background: #FFEBEE; color: #C62828; }
+
+.concern-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.concern-chip {
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--accent-light);
+  color: var(--accent);
+  border: 1px solid rgba(79, 70, 229, 0.15);
+}
+
+.clinical-bullets {
+  margin: 0;
+  padding: 0 0 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  list-style: disc;
+}
+
+.clinical-bullets li {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+/* ── Recommended Actives Card (visual centerpiece) ───────────────────────────── */
+.actives-card {
+  background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+
+.actives-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.actives-icon { font-style: normal; }
+
+.actives-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.9);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}
+
+.actives-source {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.35);
+  letter-spacing: 0.3px;
+}
+
+.actives-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.active-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.active-name {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #fff;
+  min-width: 110px;
+}
+
+.active-arrow {
+  font-size: 13px;
+  color: #818CF8;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.active-mechanism {
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.7);
+  flex: 1;
+}
+
+.active-target {
+  font-size: 11px;
+  background: rgba(99, 102, 241, 0.25);
+  color: #A5B4FC;
+  padding: 2px 9px;
+  border-radius: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ── Compact alert banner ────────────────────────────────────────────────────── */
+.compact-alert {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
+  line-height: 1.4;
+}
+
+.compact-alert-severe {
+  background: #FFF5F5;
+  border-color: #FEB2B2;
+  color: #C53030;
+}
+
 /* ── Stage 2 product fetch ───────────────────────────────────────────────────── */
 .get-products-btn {
   margin-top: 8px;
