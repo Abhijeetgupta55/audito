@@ -541,7 +541,6 @@ export default function Consultation() {
             <span className="logo-sub">Skin &amp; Hair Diagnostic Assistant</span>
           </div>
         </div>
-        <span className="header-badge">Database-grounded</span>
       </header>
 
       <main className="chat-area">

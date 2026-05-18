@@ -170,7 +170,7 @@ const MiniTrend = ({ trends }) => {
 const PhotoCard = ({ card, nav }) => (
   <div className="dc dc-photo">
     <div className="dc-head">
-      <span className="dc-label">📸 Photo Analysis</span>
+      <span className="dc-label">Photo Analysis</span>
       {card.lowConfidence && <span className="dc-badge-warn">Limited quality</span>}
     </div>
     <div className="dc-body">
@@ -199,7 +199,7 @@ const ProgressCard = ({ card, nav }) => {
   return (
     <div className="dc dc-progress">
       <div className="dc-head">
-        <span className="dc-label">📈 Progress</span>
+        <span className="dc-label">Progress</span>
         {pr.comparison?.previous_date && (
           <span className="dc-badge">vs {pr.comparison.previous_date}</span>
         )}
@@ -237,7 +237,7 @@ const ProgressCard = ({ card, nav }) => {
 const SummaryCard = ({ card, nav }) => (
   <div className="dc dc-summary">
     <div className="dc-head">
-      <span className="dc-label">🔬 Clinical Summary</span>
+      <span className="dc-label">Clinical Summary</span>
       <div className="dc-head-right">
         {card.severity && card.severity !== 'unknown' && (
           <span className={`dc-sev dc-sev-${card.severity}`}>{card.severity}</span>
@@ -264,7 +264,7 @@ const SummaryCard = ({ card, nav }) => (
 const ActivesCard = ({ card, nav }) => (
   <div className="dc dc-actives">
     <div className="dc-head dc-head-dark">
-      <span className="dc-label-light">⚗️ Recommended Actives</span>
+      <span className="dc-label-light">Recommended Actives</span>
       <span className="dc-badge-faint">KB-grounded</span>
     </div>
     <div className="dc-body">
@@ -288,7 +288,7 @@ const ActivesCard = ({ card, nav }) => (
 const ActivesPendingCard = ({ nav }) => (
   <div className="dc dc-actives">
     <div className="dc-head dc-head-dark">
-      <span className="dc-label-light">⚗️ Recommended Actives</span>
+      <span className="dc-label-light">Recommended Actives</span>
     </div>
     <div className="dc-body dc-actives-pending-body">
       <div className="dc-actives-pending-row">
@@ -303,7 +303,7 @@ const ActivesPendingCard = ({ nav }) => (
 const WarningCard = ({ card, nav }) => (
   <div className={`dc dc-warning${card.severe ? ' dc-warning-severe' : ''}`}>
     <div className="dc-head">
-      <span className="dc-label">{card.severe ? '🚨 Important' : '⚠ Note'}</span>
+      <span className="dc-label">{card.severe ? 'Important' : 'Note'}</span>
     </div>
     <div className="dc-body">
       <p className="dc-warning-text">{card.text}</p>
@@ -315,7 +315,7 @@ const WarningCard = ({ card, nav }) => (
 const ProductsCTACard = ({ card, nav, onCTA }) => (
   <div className="dc dc-cta">
     <div className="dc-head">
-      <span className="dc-label">💊 Products</span>
+      <span className="dc-label">Products</span>
     </div>
     <div className="dc-body dc-cta-body">
       <p className="dc-cta-headline">Ready for product recommendations?</p>
@@ -331,7 +331,7 @@ const ProductsCTACard = ({ card, nav, onCTA }) => (
 const ProductsLoadingCard = ({ nav }) => (
   <div className="dc dc-cta">
     <div className="dc-head">
-      <span className="dc-label">💊 Products</span>
+      <span className="dc-label">Products</span>
     </div>
     <div className="dc-body dc-cta-body">
       <div className="dc-loader-row">
@@ -346,7 +346,7 @@ const ProductsLoadingCard = ({ nav }) => (
 const ProductsCard = ({ card, nav }) => (
   <div className="dc dc-products">
     <div className="dc-head">
-      <span className="dc-label">💊 Matched Products</span>
+      <span className="dc-label">Matched Products</span>
       <span className="dc-badge">database</span>
     </div>
     <div className="dc-body dc-products-body">
@@ -379,7 +379,7 @@ const ProductsCard = ({ card, nav }) => (
 const IntakeCard = ({ card }) => (
   <div className="dc dc-intake">
     <div className="dc-head">
-      <span className="dc-label">🩺 A few questions</span>
+      <span className="dc-label">A few questions</span>
     </div>
     <div className="dc-body">
       {card.text.split('\n').filter(l => l.trim()).map((line, i) => (
