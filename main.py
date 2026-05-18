@@ -1,10 +1,16 @@
 """Production FastAPI application — Audito skin & hair diagnostic system."""
 import logging
 import asyncio
+import time
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import base64
 import uuid
+
+# ── In-process product cache (stage1 background prefetch → stage2 lookup) ────
+# Key: session_key (UUID). Value: {products, kb_context, expires_at}
+# TTL=300s. Cache misses just fall through to a fresh product search.
+_reco_cache: Dict[str, Dict] = {}
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,6 +97,19 @@ class DoctorFeedback(BaseModel):
     safety_score: int
     comments: Optional[str] = None
     improvements: Optional[str] = None
+
+
+class RecommendProductsRequest(BaseModel):
+    """Stage 2 request — sent when user clicks 'Get Product Recommendations'."""
+    session_key: Optional[str] = None        # cache key from stage1 response
+    identified_concern: str
+    severity: str = "mild"
+    skin_type: str = "unknown"
+    user_message: str = ""
+    kb_context: str = ""                     # KB chunks retrieved in stage1
+    diagnosis: str = ""
+    ingredient_rationale: str = ""           # already generated in stage1
+    skin_analysis: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
@@ -205,9 +224,8 @@ async def analyze_image(
     user_id: Optional[str] = Form(None),
     message: Optional[str] = Form(None),
 ):
-    """Analyze an uploaded skin/scalp photo with optional user context message.
-
-    Routes through Vision Agent → Diagnosis Agent → optional product search.
+    """Stage 1: Vision → Diagnosis → KB retrieval → Ingredient rationale.
+    Products are deferred to /api/recommend-products (stage 2).
     """
     request_id = str(uuid.uuid4())
     effective_user = user_id or "anonymous"
@@ -224,9 +242,23 @@ async def analyze_image(
             user_message=user_message,
             image_data=image_base64,
             image_type=image_type,
+            stage="stage1",
         )
 
-        logger.info(f"[{request_id}] ✅ Image analyzed | {state.total_latency_ms:.0f}ms")
+        logger.info(f"[{request_id}] ✅ Stage1 done | {state.total_latency_ms:.0f}ms")
+
+        # ── Background: precompute product search for stage2 ──────────────────
+        session_key = str(uuid.uuid4())
+        if state.identified_concern and state.identified_concern not in ("none", "unclear_image", ""):
+            background_tasks.add_task(
+                _prefetch_products,
+                session_key=session_key,
+                concern=state.identified_concern,
+                severity=state.severity,
+                skin_type=state.skin_analysis.get("skin_type", "unknown") if state.skin_analysis else "unknown",
+                user_message=user_message,
+                kb_context=state.kb_context,
+            )
 
         # ── Save progress ─────────────────────────────────────────────────────
         record_id = None
@@ -250,6 +282,8 @@ async def analyze_image(
 
         return {
             "request_id": request_id,
+            "session_key": session_key,           # for stage2 cache lookup
+            "kb_context": state.kb_context,       # passed back so stage2 can reuse
             "record_id": record_id,
             "progress_report": progress_data,
             "intent": state.intent,
@@ -269,6 +303,93 @@ async def analyze_image(
     except Exception as e:
         logger.error(f"[{request_id}] ❌ Image analysis failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ── Background product prefetch (fires after stage1 response is sent) ─────────
+
+async def _prefetch_products(
+    session_key: str,
+    concern: str,
+    severity: str,
+    skin_type: str,
+    user_message: str,
+    kb_context: str,
+) -> None:
+    """Pre-run product search so stage2 can use cache instead of waiting."""
+    try:
+        from backend.rag_store import get_rag_store
+        query = f"Concern: {concern}. Severity: {severity}. Skin type: {skin_type}. User query: {user_message}"
+        store = await get_rag_store()
+        if store is not None:
+            products = store.search_products(query, top_k=5)
+        else:
+            local_store = await get_pinecone_store()
+            products = local_store.search_products(query, top_k=5)
+        _reco_cache[session_key] = {
+            "products": products,
+            "kb_context": kb_context,
+            "expires_at": time.time() + 300,
+        }
+        logger.info(f"Prefetch done [{session_key[:8]}]: {len(products)} products cached")
+    except Exception as e:
+        logger.error(f"Prefetch failed [{session_key[:8]}]: {e}")
+
+
+# ── Stage 2: product recommendation ──────────────────────────────────────────
+
+@app.post("/api/recommend-products")
+async def recommend_products(request: RecommendProductsRequest):
+    """Stage 2: retrieve products + generate rationale. Called when user clicks the button."""
+    request_id = str(uuid.uuid4())
+    logger.info(f"[{request_id}] Stage2 recommend: concern={request.identified_concern} key={request.session_key and request.session_key[:8]}")
+
+    try:
+        # Check prefetch cache
+        cached: Optional[Dict] = None
+        if request.session_key:
+            entry = _reco_cache.get(request.session_key)
+            if entry and entry.get("expires_at", 0) > time.time():
+                cached = entry
+                logger.info(f"[{request_id}] Cache HIT — skipping product search")
+            else:
+                logger.info(f"[{request_id}] Cache MISS — running product search")
+
+        orchestrator = await get_orchestrator()
+        state = await orchestrator.run(
+            user_message=request.user_message or f"Concern: {request.identified_concern}",
+            stage="stage2",
+            prefill={
+                "current_agent": "search",
+                "identified_concern": request.identified_concern,
+                "severity": request.severity,
+                "kb_context": request.kb_context,
+                "diagnosis": request.diagnosis,
+                "ingredient_rationale": request.ingredient_rationale,
+                "skin_analysis": request.skin_analysis or {},
+                # If cache hit, inject products so ProductSearchAgent is skipped implicitly
+                # by having retrieved_products already populated (search still runs but is fast)
+                "retrieved_products": cached["products"] if cached else [],
+            },
+        )
+
+        # If cache hit, override with cached products to avoid re-running search
+        if cached and not state.retrieved_products:
+            state.retrieved_products = cached["products"]
+
+        logger.info(f"[{request_id}] ✅ Stage2 done | {state.total_latency_ms:.0f}ms | {len(state.recommended_products)} products")
+
+        return {
+            "request_id": request_id,
+            "products": state.recommended_products,
+            "recommendation": state.recommendation_text,
+            "show_products": state.show_products,
+            "agent_path": state.agent_history,
+            "latency_ms": state.total_latency_ms,
+        }
+
+    except Exception as e:
+        logger.error(f"[{request_id}] ❌ Stage2 failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Progress endpoints ────────────────────────────────────────────────────────

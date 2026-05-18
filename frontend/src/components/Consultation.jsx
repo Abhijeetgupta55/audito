@@ -293,6 +293,29 @@ export default function Consultation() {
     setMessages(prev => [...prev, { id: Date.now() + Math.random(), ...msg }]);
   }, []);
 
+  const handleGetProducts = useCallback(async (msgId, stage2Data) => {
+    setMessages(prev => prev.map(m =>
+      m.id === msgId ? { ...m, stage2Loading: true } : m
+    ));
+    try {
+      const { data } = await axios.post(`${API}/api/recommend-products`, stage2Data, { timeout: 30000 });
+      setMessages(prev => prev.map(m =>
+        m.id === msgId ? {
+          ...m,
+          products: data.products || [],
+          recommendation: data.recommendation || '',
+          show_products: data.show_products,
+          stage2Pending: false,
+          stage2Loading: false,
+        } : m
+      ));
+    } catch (err) {
+      setMessages(prev => prev.map(m =>
+        m.id === msgId ? { ...m, stage2Loading: false } : m
+      ));
+    }
+  }, []);
+
   // ── Select image — don't upload yet, just preview ─────────────────────────
 
   const handleImageSelect = (e) => {
@@ -335,22 +358,38 @@ export default function Consultation() {
           timeout: 90000,
         });
 
+        const hasIngredients = !!data.ingredient_rationale;
+        const isIntake = !data.recommendation && !!data.diagnosis && (data.agent_path || []).slice(-1)[0] === 'diagnosis';
         addMsg({
           role: 'assistant',
           type: 'response',
-          content: data.recommendation || data.diagnosis || 'Analysis complete.',
+          content: data.diagnosis || 'Analysis complete.',
           intent: data.intent,
           concern: data.identified_concern,
           severity: data.severity,
           diagnosis: data.diagnosis,
           ingredientRationale: data.ingredient_rationale || '',
-          recommendation: data.recommendation,
+          recommendation: data.recommendation || '',
           skinAnalysis: data.skin_analysis,
           progressReport: data.progress_report,
-          products: data.show_products ? (data.products || []) : [],
+          products: [],
           warnings: data.warnings || [],
           agentPath: data.agent_path || [],
-          isIntakeQuestion: !data.recommendation && !!data.diagnosis && (data.agent_path || []).slice(-1)[0] === 'diagnosis',
+          isIntakeQuestion: isIntake,
+          // Stage 2 deferred product fetch
+          stage2Pending: hasIngredients && !isIntake,
+          stage2Loading: false,
+          stage2Data: hasIngredients && !isIntake ? {
+            session_key: data.session_key || null,
+            identified_concern: data.identified_concern || '',
+            severity: data.severity || 'mild',
+            skin_type: data.skin_analysis?.skin_type || 'unknown',
+            user_message: text || 'Please analyze my skin or hair condition from this photo.',
+            kb_context: data.kb_context || '',
+            diagnosis: data.diagnosis || '',
+            ingredient_rationale: data.ingredient_rationale || '',
+            skin_analysis: data.skin_analysis || null,
+          } : null,
         });
 
       } catch (err) {
@@ -487,6 +526,20 @@ export default function Consultation() {
                         {msg.products.map((p, j) => <ProductCard key={j} product={p} />)}
                       </div>
                     </div>
+                  )}
+                  {msg.stage2Loading && (
+                    <div className="stage2-loading">
+                      <TypingDots />
+                      <span className="stage2-loading-text">Finding matching products…</span>
+                    </div>
+                  )}
+                  {msg.stage2Pending && !msg.stage2Loading && (
+                    <button
+                      className="get-products-btn"
+                      onClick={() => handleGetProducts(msg.id, msg.stage2Data)}
+                    >
+                      Get Product Recommendations
+                    </button>
                   )}
                   {msg.agentPath?.length > 0 && (
                     <div className="agent-path">{msg.agentPath.join(' → ')}</div>

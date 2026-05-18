@@ -346,6 +346,39 @@ body {
   margin: 0;
 }
 
+/* ── Stage 2 product fetch ───────────────────────────────────────────────────── */
+.get-products-btn {
+  margin-top: 8px;
+  padding: 9px 18px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent);
+  background: var(--accent-light);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  align-self: flex-start;
+}
+
+.get-products-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.stage2-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.stage2-loading-text {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
 /* ── Warning box ─────────────────────────────────────────────────────────────── */
 .warning-box {
   background: var(--warn-bg);

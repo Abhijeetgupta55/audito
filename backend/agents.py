@@ -113,6 +113,7 @@ class AgentState:
     conversation_history: List[Dict[str, str]] = field(default_factory=list)
     image_data: Optional[str] = None
     image_type: Optional[str] = None
+    stage: str = "full"  # "full" | "stage1" | "stage2"
 
     current_agent: str = "triage"
     agent_history: List[str] = field(default_factory=list)
@@ -433,18 +434,16 @@ Respond ONLY in valid JSON:
 }"""
 
     # --- Phase 2: Differential diagnosis ---
-    DIFFERENTIAL_SYSTEM = """You are a clinical dermatologist AI writing a short assessment note.
+    DIFFERENTIAL_SYSTEM = """You are a clinical dermatologist AI. Output exactly 3 bullet points — no prose, no headers.
 
-Write 2-4 sentences of plain prose covering:
-1. Most likely picture based on the history, with 1-2 differential possibilities using conservative language ("consistent with", "may represent", "could indicate")
-2. What you cannot determine without a physical exam
-3. One concrete next step (use a product-based approach for mild-moderate cases, refer to a dermatologist for severe or unclear cases)
+• [Most likely picture — "consistent with X" or "may represent Y". Add 1 differential if relevant. Flag red flags inline.]
+• [What cannot be confirmed without physical exam — 1 clause.]
+• [Next step — product-based for mild/moderate; dermatologist referral for severe/unclear.]
 
 Rules:
-- Plain text only — no bold headers, no bullet points, no numbered lists, no confidence percentages, no JSON
-- Never state a single definitive diagnosis
-- If there are red flags (rapidly spreading, signs of infection, sudden hair loss), state them plainly in one sentence
-- Conservative and honest — you are a clinical aid, not a replacement for a doctor"""
+- Exactly 3 bullets, 1 sentence each, no nesting, no JSON
+- Conservative language — never a single definitive diagnosis
+- Total output under 55 words"""
 
     def _build_history_text(self, history: list, current_message: str) -> str:
         """Format conversation history into a readable clinical transcript."""
@@ -544,7 +543,7 @@ Rules:
         )
 
         try:
-            raw_diff = _generate([self.DIFFERENTIAL_SYSTEM, diff_prompt], max_tokens=600).strip()
+            raw_diff = _generate([self.DIFFERENTIAL_SYSTEM, diff_prompt], max_tokens=200).strip()
             # Plain text output — store as-is
             diagnosis_text = raw_diff
             state.diagnosis_data = {"assessment": raw_diff}
@@ -553,21 +552,17 @@ Rules:
             logger.error(f"Differential diagnosis LLM failed: {e}")
             concern_label = state.identified_concern.replace("_", " ")
             if state.skin_analysis and state.skin_analysis.get("clinical_observation"):
-                obs = state.skin_analysis["clinical_observation"]
                 conds = ", ".join(state.skin_analysis.get("conditions", []))
-                skin_type = state.skin_analysis.get("skin_type", "")
                 fallback = (
-                    f"The photo shows {skin_type + ' skin with ' if skin_type and skin_type != 'unknown' else ''}"
-                    f"{conds or concern_label}. {obs} "
-                    "Without a physical examination, a definitive diagnosis is not possible — "
-                    "a dermatologist can confirm this and recommend a targeted treatment plan."
+                    f"• Findings consistent with {conds or concern_label}.\n"
+                    "• Extent and severity cannot be confirmed without physical examination.\n"
+                    "• Review matched products below; consult a dermatologist for a confirmed diagnosis."
                 )
             else:
                 fallback = (
-                    f"Your description is consistent with {concern_label}. "
-                    "To give you a more complete picture, it would help to know how long you have had this, "
-                    "exactly where it is on your body, and whether you experience any itching or pain. "
-                    "A dermatologist can provide a confirmed diagnosis."
+                    f"• Description consistent with {concern_label} — duration, location, and associated symptoms needed to narrow further.\n"
+                    "• Cannot assess severity or rule out differentials without examination.\n"
+                    "• Provide more detail or consult a dermatologist for a confirmed diagnosis."
                 )
             return {
                 "diagnosis": fallback,
@@ -670,7 +665,7 @@ Style: direct, conversational, no filler phrases. Match the energy of the messag
 
 class ProductSearchAgent:
     async def process(self, state: AgentState) -> Dict[str, Any]:
-        logger.info("Product Search Agent running")
+        logger.info(f"Product Search Agent running (stage={state.stage})")
 
         # Guard: skip if no real concern
         if not state.identified_concern or state.identified_concern in ("none", "unclear_image", ""):
@@ -691,17 +686,39 @@ class ProductSearchAgent:
                 f"Skin type: {skin_type}. User query: {state.user_message}"
             )
 
+            if state.stage == "stage2":
+                # KB context already retrieved in stage1 — only run product search
+                if store is not None:
+                    products = store.search_products(query, top_k=5)
+                    logger.info(f"Stage2 RAG: {len(products)} products for {state.identified_concern}")
+                else:
+                    logger.warning("RAG unavailable, falling back to keyword search")
+                    from backend.vector_store import get_pinecone_store
+                    local = await get_pinecone_store()
+                    products = local.search_products(query, top_k=5)
+                return {
+                    "search_query": query,
+                    "retrieved_products": products,
+                    "current_agent": "recommendation",
+                    "agent_history": state.agent_history + ["search"],
+                }
+
+            # stage1 or full: always retrieve KB context
+            kb_context = ""
+            products = []
             if store is not None:
                 kb_context = store.search_knowledge(query, top_k=3)
-                products = store.search_products(query, top_k=5)
-                logger.info(f"RAG: {len(products)} products, {len(kb_context)} KB chars for: {state.identified_concern}")
+                if state.stage == "full":
+                    products = store.search_products(query, top_k=5)
+                    logger.info(f"RAG full: {len(products)} products, {len(kb_context)} KB chars")
+                else:
+                    logger.info(f"Stage1 RAG: KB only, {len(kb_context)} KB chars")
             else:
-                # RAG unavailable — fall back to local keyword store
-                logger.warning("RAG store unavailable, falling back to keyword search")
+                logger.warning("RAG unavailable, falling back to keyword search")
                 from backend.vector_store import get_pinecone_store
                 local = await get_pinecone_store()
-                products = local.search_products(query, top_k=5)
-                kb_context = ""
+                if state.stage == "full":
+                    products = local.search_products(query, top_k=5)
 
             return {
                 "search_query": query,
@@ -726,24 +743,120 @@ class ProductSearchAgent:
 # ---------------------------------------------------------------------------
 
 class RecommendationAgent:
-    SYSTEM = """You are a clinical dermatology assistant. Structure your response using EXACTLY these two section headers on their own lines:
+    # Stage1: ingredient reasoning from KB — no products needed
+    INGREDIENTS_SYSTEM = """You are a clinical dermatology assistant. Output 2-3 bullet points only.
+
+Each bullet: • [active ingredient] — [mechanism from KB] — [why it addresses this specific concern]
+
+Rules:
+- No prose, no headers, no product names, no intro openers
+- Ground every claim in the Knowledge Base context provided
+- Do NOT repeat the clinical diagnosis
+- Total output under 60 words"""
+
+    # Stage2: per-product rationale — ingredient reasoning already shown
+    PRODUCTS_SYSTEM = """You are a clinical dermatology assistant. Output one bullet per product, then one caution line.
+
+Each bullet: • **[Product name]** — [key active] → [specific benefit for this patient's concern]
+After the last product: ⚠ [one-line caution — sun sensitivity / interactions / patch test]
+
+Rules:
+- Max 3 product bullets, no intro sentences, no marketing language
+- Only reference products from the provided list — never invent names
+- Do NOT re-explain ingredient rationale — it was already shown
+- Total output under 80 words"""
+
+    # Full mode: both sections in one pass (used by text/chat pipeline)
+    SYSTEM = """You are a clinical dermatology assistant. Use EXACTLY these two section headers on their own lines:
 
 INGREDIENTS:
-Write a flowing, reasoned paragraph explaining which active ingredients are most appropriate for this specific skin condition and why. Name the condition observed, then introduce each active with its mechanism from the Dermatology Knowledge Base. Connect the ingredient to a visible sign (e.g. "aging is present so retinol is preferred — it directly stimulates collagen synthesis and accelerates cell turnover"). 3-6 sentences, conversational but precise. Do not use bullet points.
+2-3 bullets. Each: • [active] — [mechanism from KB] — [why it addresses this concern]
 
 PRODUCTS:
-For each product write one sentence: [Product name] — [key active] works by [mechanism], addressing [specific observation from this patient's case]. Add a second sentence only for an important usage note. After the last product, add one plain caution note (ingredient interactions, sun sensitivity, or patch testing).
+One bullet per product (max 3): • **[Product name]** — [key active] → [specific benefit for this patient]
+After the last product: ⚠ [one-line caution]
 
-Rules that apply to both sections:
-- No intro openers ("Based on your...", "I recommend...", "These products will...").
-- No marketing language ("powerful", "clinically proven", "revolutionary", "amazing").
-- Ground every claim in the Dermatology Knowledge Base context provided.
-- ONLY reference products from the provided list — never invent product names.
-- Do NOT repeat the clinical diagnosis — it was already shown to the patient."""
+Rules:
+- No intro openers, no marketing language, no prose paragraphs
+- Ground every claim in the Knowledge Base context provided
+- ONLY reference products from the provided list — never invent names
+- Do NOT repeat the clinical diagnosis
+- Total output under 120 words"""
 
     async def process(self, state: AgentState) -> Dict[str, Any]:
-        logger.info("Recommendation Agent running")
+        logger.info(f"Recommendation Agent running (stage={state.stage})")
+        if state.stage == "stage1":
+            return await self._run_stage1(state)
+        if state.stage == "stage2":
+            return await self._run_stage2(state)
+        return await self._run_full(state)
 
+    # ── Stage 1: ingredient rationale only ───────────────────────────────────
+    async def _run_stage1(self, state: AgentState) -> Dict[str, Any]:
+        obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
+        ingredient_rationale = ""
+        if _ensure_gemini() and state.kb_context:
+            try:
+                ctx = (
+                    f"Concern: {state.identified_concern.replace('_', ' ')} ({state.severity})\n"
+                    f"Clinical observation: {obs or 'N/A'}\n\n"
+                    f"Dermatology Knowledge Context:\n{state.kb_context}"
+                )
+                ingredient_rationale = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=180).strip()
+            except Exception as e:
+                logger.error(f"Stage1 ingredient rationale failed: {e}")
+        return {
+            "ingredient_rationale": ingredient_rationale,
+            "recommendation_text": "",
+            "recommended_products": [],
+            "show_products": False,
+            "current_agent": "safety",
+            "agent_history": state.agent_history + ["recommendation"],
+        }
+
+    # ── Stage 2: product text only ────────────────────────────────────────────
+    async def _run_stage2(self, state: AgentState) -> Dict[str, Any]:
+        products = state.retrieved_products
+        if not products:
+            return {
+                "ingredient_rationale": state.ingredient_rationale,
+                "recommendation_text": "No matching products were found in our database for this concern.",
+                "recommended_products": [],
+                "show_products": False,
+                "current_agent": "safety",
+                "agent_history": state.agent_history + ["recommendation"],
+            }
+        product_context = "\n".join([
+            f"- {p['name']} by {p['brand']}: {p.get('description', '')} "
+            f"[Key ingredients: {', '.join(p.get('key_ingredients', [])[:3])}]"
+            for p in products[:5]
+        ])
+        obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
+        rec_text = ""
+        if _ensure_gemini():
+            try:
+                ctx = (
+                    f"Concern: {state.identified_concern.replace('_', ' ')} ({state.severity})\n"
+                    f"Clinical observation: {obs or 'N/A'}\n\n"
+                    f"Dermatology Knowledge Context:\n{state.kb_context or ''}\n\n"
+                    f"Available products:\n{product_context}"
+                )
+                rec_text = _generate([self.PRODUCTS_SYSTEM, ctx], max_tokens=250).strip()
+            except Exception as e:
+                logger.error(f"Stage2 product recommendation failed: {e}")
+        if not rec_text:
+            rec_text = "Matched products from the database for your concern are shown below."
+        return {
+            "ingredient_rationale": state.ingredient_rationale,
+            "recommendation_text": rec_text,
+            "recommended_products": products[:3],
+            "show_products": True,
+            "current_agent": "safety",
+            "agent_history": state.agent_history + ["recommendation"],
+        }
+
+    # ── Full mode: both sections in one pass (text/chat pipeline) ─────────────
+    async def _run_full(self, state: AgentState) -> Dict[str, Any]:
         products = state.retrieved_products
         if not products:
             text = (
@@ -758,16 +871,12 @@ Rules that apply to both sections:
                 "current_agent": "safety",
                 "agent_history": state.agent_history + ["recommendation"],
             }
-
-        # Build product context
         product_context = "\n".join([
             f"- {p['name']} by {p['brand']}: {p.get('description', '')} "
             f"[Key ingredients: {', '.join(p.get('key_ingredients', [])[:3])}]"
             for p in products[:5]
         ])
-
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
-
         raw_text = ""
         if _ensure_gemini():
             try:
@@ -777,10 +886,9 @@ Rules that apply to both sections:
                     f"Dermatology Knowledge Context:\n{state.kb_context}\n\n"
                     f"Available products:\n{product_context}"
                 )
-                raw_text = _generate([self.SYSTEM, user_ctx], max_tokens=900).strip()
+                raw_text = _generate([self.SYSTEM, user_ctx], max_tokens=350).strip()
             except Exception as e:
-                logger.error(f"Recommendation LLM failed: {e}")
-
+                logger.error(f"Full recommendation LLM failed: {e}")
         # Parse INGREDIENTS: / PRODUCTS: sections
         ingredient_rationale = ""
         rec_text = ""
@@ -792,10 +900,8 @@ Rules that apply to both sections:
             ingredient_rationale = raw_text.replace("INGREDIENTS:", "").strip()
         elif raw_text:
             rec_text = raw_text
-
         if not rec_text and not ingredient_rationale:
             rec_text = "Matched products from the database for your concern are shown below."
-
         return {
             "ingredient_rationale": ingredient_rationale,
             "recommendation_text": rec_text,
@@ -811,15 +917,17 @@ Rules that apply to both sections:
 # ---------------------------------------------------------------------------
 
 class DoctorExpertAgent:
-    SYSTEM = """You are a dermatologist providing first-response clinical guidance for a severe skin or hair condition.
+    SYSTEM = """You are a dermatologist giving urgent clinical guidance. Output exactly 4 bullets — no prose.
 
-Provide:
-1. A clear explanation of why this severity warrants professional care
-2. What the user should do RIGHT NOW (safe interim steps)
-3. What type of specialist to see and what to expect
-4. What to AVOID doing before the appointment
+• **Urgency**: [why this severity requires professional care — 1 clause]
+• **Do now**: [1-2 safe interim steps, comma-separated]
+• **See**: [specialist type] — [what to expect at the appointment]
+• **Avoid**: [1-2 things to avoid before appointment]
 
-Be factual, reassuring but clear about urgency. 3-4 paragraphs. Do NOT recommend OTC products for severe cases."""
+Rules:
+- Exactly 4 bullets, 1 sentence each, no paragraphs
+- No OTC product recommendations for severe cases
+- Total output under 70 words"""
 
     async def process(self, state: AgentState) -> Dict[str, Any]:
         logger.info("Doctor Expert Agent running")
@@ -831,15 +939,17 @@ Be factual, reassuring but clear about urgency. 3-4 paragraphs. Do NOT recommend
                     f"Concern: {state.identified_concern.replace('_', ' ')} — {state.severity}\n"
                     f"User description: {state.user_message}"
                 )
-                guidance = _generate([self.SYSTEM, ctx], max_tokens=600).strip()
+                guidance = _generate([self.SYSTEM, ctx], max_tokens=220).strip()
             except Exception as e:
                 logger.error(f"Doctor Expert Agent failed: {e}")
 
         if not guidance:
+            concern_label = state.identified_concern.replace("_", " ")
             guidance = (
-                f"Your {state.identified_concern.replace('_', ' ')} concern appears to be {state.severity} "
-                "in severity. This level warrants an in-person consultation with a certified dermatologist. "
-                "In the meantime, keep the area clean, avoid harsh products, and do not self-medicate."
+                f"• **Urgency**: Severity warrants in-person evaluation — {concern_label} at {state.severity} level.\n"
+                "• **Do now**: Keep area clean, apply fragrance-free moisturiser if needed.\n"
+                "• **See**: Certified dermatologist — expect clinical examination and possible patch testing.\n"
+                "• **Avoid**: Self-medicating, harsh actives, or squeezing/picking before appointment."
             )
 
         return {
@@ -906,6 +1016,8 @@ class MultiAgentOrchestrator:
         conversation_history: Optional[List[Dict]] = None,
         image_data: Optional[str] = None,
         image_type: Optional[str] = None,
+        stage: str = "full",
+        prefill: Optional[Dict] = None,
     ) -> AgentState:
         t0 = datetime.utcnow()
         state = AgentState(
@@ -913,7 +1025,13 @@ class MultiAgentOrchestrator:
             conversation_history=conversation_history or [],
             image_data=image_data,
             image_type=image_type,
+            stage=stage,
         )
+        # Pre-populate state for stage2 (skips vision/diagnosis/triage)
+        if prefill:
+            for key, value in prefill.items():
+                if hasattr(state, key):
+                    setattr(state, key, value)
 
         max_steps = 10
         for step in range(max_steps):
