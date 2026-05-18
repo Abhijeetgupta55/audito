@@ -107,6 +107,17 @@
   white-space: nowrap;
 }
 
+.dc-badge-warn {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: rgba(251,191,36,0.18);
+  color: #D97706;
+  white-space: nowrap;
+  border: 1px solid rgba(251,191,36,0.3);
+}
+
 .dc-disclaimer {
   font-size: 10px;
   color: var(--text-muted);
@@ -564,6 +575,25 @@
   color: var(--text-muted);
   line-height: 1.5;
   margin-top: 6px;
+}
+
+/* ── Actives pending card ─────────────────────────────────────────── */
+.dc-actives-pending-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 16px;
+}
+
+.dc-actives-pending-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dc-actives-pending-text {
+  font-size: 13px;
+  color: rgba(199,210,254,0.6);
 }
 
 /* ── Intake card ──────────────────────────────────────────────────── */

@@ -20,7 +20,8 @@ export function buildCards(msg) {
     msg.stage2Pending ||
     msg.stage2Loading ||
     msg.progressReport ||
-    msg.diagnosis
+    msg.diagnosis ||
+    msg.concern  // a real concern was identified even if other fields are sparse
   );
   if (!hasStructure) return [];
 
@@ -28,7 +29,7 @@ export function buildCards(msg) {
 
   // 1 — Photo analysis
   if (msg.skinAnalysis?.clinical_observation) {
-    cards.push({ type: 'photo', data: msg.skinAnalysis });
+    cards.push({ type: 'photo', data: msg.skinAnalysis, lowConfidence: !!(msg.skinAnalysis?.low_confidence || msg.lowConfidence) });
   }
 
   // 2 — Progress tracking
@@ -53,7 +54,7 @@ export function buildCards(msg) {
     }
   }
 
-  // 4 — Recommended actives
+  // 4 — Recommended actives (with placeholder if unavailable)
   if (msg.actives?.length) {
     cards.push({ type: 'actives', actives: msg.actives });
   } else if (msg.ingredientRationale) {
@@ -64,7 +65,14 @@ export function buildCards(msg) {
         ? { name: parts[0], mechanism: parts[1], target_concern: parts.slice(2).join(' — ') }
         : null;
     }).filter(Boolean);
-    if (parsed.length) cards.push({ type: 'actives', actives: parsed });
+    if (parsed.length) {
+      cards.push({ type: 'actives', actives: parsed });
+    } else {
+      cards.push({ type: 'actives_pending' });
+    }
+  } else if (!msg.isIntakeQuestion && (msg.diagnosisData?.diagnosis_summary?.length || msg.diagnosis || msg.concern)) {
+    // Has a real concern/diagnosis but actives not yet available
+    cards.push({ type: 'actives_pending' });
   }
 
   // 5 — Warning / caution
@@ -163,8 +171,12 @@ const PhotoCard = ({ card, nav }) => (
   <div className="dc dc-photo">
     <div className="dc-head">
       <span className="dc-label">📸 Photo Analysis</span>
+      {card.lowConfidence && <span className="dc-badge-warn">Limited quality</span>}
     </div>
     <div className="dc-body">
+      {card.lowConfidence && card.data.clarity_feedback && (
+        <p className="dc-inline-warn">⚠ {card.data.clarity_feedback}</p>
+      )}
       {(card.data.skin_type && card.data.skin_type !== 'unknown' || card.data.conditions?.length > 0) && (
         <div className="dc-tag-row">
           {card.data.skin_type && card.data.skin_type !== 'unknown' && (
@@ -267,6 +279,21 @@ const ActivesCard = ({ card, nav }) => (
             </div>
           </div>
         ))}
+      </div>
+    </div>
+    {nav}
+  </div>
+);
+
+const ActivesPendingCard = ({ nav }) => (
+  <div className="dc dc-actives">
+    <div className="dc-head dc-head-dark">
+      <span className="dc-label-light">⚗️ Recommended Actives</span>
+    </div>
+    <div className="dc-body dc-actives-pending-body">
+      <div className="dc-actives-pending-row">
+        <div className="dc-spinner" />
+        <span className="dc-actives-pending-text">Ingredient analysis still refining…</span>
       </div>
     </div>
     {nav}
@@ -408,6 +435,7 @@ export default function DiagnosticDeck({ msg, onGetProducts }) {
       case 'progress':         return <ProgressCard card={card} nav={nav} />;
       case 'summary':          return <SummaryCard card={card} nav={nav} />;
       case 'actives':          return <ActivesCard card={card} nav={nav} />;
+      case 'actives_pending':  return <ActivesPendingCard nav={nav} />;
       case 'warning':          return <WarningCard card={card} nav={nav} />;
       case 'products_cta':     return <ProductsCTACard card={card} nav={nav} onCTA={handleCTA} />;
       case 'products_loading': return <ProductsLoadingCard nav={nav} />;

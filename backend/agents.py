@@ -351,22 +351,55 @@ Respond ONLY in valid JSON:
             )
             text = _generate([self.SYSTEM, img_part], model_name=settings.GEMINI_VISION_MODEL, max_tokens=800)
             analysis = _parse_json(text)
-            logger.info(f"Vision analysis: is_clear={analysis.get('is_clear')}")
+            confidence = float((analysis.get("metrics") or {}).get("confidence_score", 0.5) or 0.5)
+            logger.info(f"Vision analysis: is_clear={analysis.get('is_clear')} confidence={confidence:.2f}")
 
-            if not analysis or analysis.get("is_clear") is False:
-                feedback = analysis.get("clarity_feedback", "The photo was not clear enough or could not be analyzed.") if analysis else "The photo was not clear enough or could not be analyzed."
-                safe_analysis = analysis or {"is_clear": False, "clarity_feedback": feedback, "metrics": {}}
+            # Determine whether the analysis has usable clinical content
+            has_content = bool(
+                analysis.get("clinical_observation") or
+                (analysis.get("conditions") and len(analysis["conditions"]) > 0) or
+                analysis.get("skin_type", "unknown") != "unknown"
+            )
+
+            if not analysis:
+                # JSON parse completely failed — nothing to work with
+                logger.warning("Vision: JSON parse empty — routing to conversational")
                 return {
-                    "skin_analysis": safe_analysis,
-                    "vision_feedback": feedback,
+                    "skin_analysis": {"is_clear": False, "metrics": {}},
+                    "vision_feedback": "The photo could not be read. Please try again with better lighting.",
                     "identified_concern": "unclear_image",
                     "current_agent": "conversational",
                     "agent_history": state.agent_history + ["vision"],
                 }
 
+            if analysis.get("is_clear") is False:
+                if has_content:
+                    # Partial analysis exists despite is_clear=False — degrade gracefully
+                    logger.warning(f"Vision: is_clear=False but has_content=True (conf={confidence:.2f}) — continuing with low_confidence")
+                    analysis["low_confidence"] = True
+                    if not analysis.get("clarity_feedback"):
+                        analysis["clarity_feedback"] = "Photo quality is limited — results may be less accurate."
+                    # Fall through to continue pipeline
+                else:
+                    # Genuinely unusable — no clinical content at all
+                    feedback = analysis.get("clarity_feedback", "The photo was not clear enough for analysis. Please try in better lighting.")
+                    logger.warning("Vision: is_clear=False AND no usable content — routing to conversational")
+                    return {
+                        "skin_analysis": analysis,
+                        "vision_feedback": feedback,
+                        "identified_concern": "unclear_image",
+                        "current_agent": "conversational",
+                        "agent_history": state.agent_history + ["vision"],
+                    }
+            elif confidence < 0.35 and has_content:
+                # is_clear=True but low confidence — warn and continue
+                logger.info(f"Vision: low confidence ({confidence:.2f}) — setting low_confidence flag")
+                analysis["low_confidence"] = True
+                if not analysis.get("clarity_feedback"):
+                    analysis["clarity_feedback"] = "Analysis confidence is limited — consider retaking with better lighting."
+
             concern = analysis.get("primary_concern") or state.identified_concern or "general"
             metrics = analysis.get("metrics", {})
-            # Attach metrics directly to analysis dict so they travel with skin_analysis
             analysis["metrics"] = metrics
             return {
                 "skin_analysis": analysis,
@@ -774,6 +807,65 @@ class ProductSearchAgent:
 # ---------------------------------------------------------------------------
 
 class RecommendationAgent:
+    # Concern-to-actives fallback — used when LLM/RAG returns empty actives
+    ACTIVES_FALLBACK: Dict[str, List[Dict[str, str]]] = {
+        "acne": [
+            {"name": "Niacinamide", "mechanism": "reduce sebum + calm inflammation", "target_concern": "acne + oiliness"},
+            {"name": "Salicylic Acid", "mechanism": "exfoliate + unclog pores", "target_concern": "blackheads + breakouts"},
+            {"name": "Benzoyl Peroxide", "mechanism": "eliminate acne bacteria", "target_concern": "active breakouts"},
+        ],
+        "dry_skin": [
+            {"name": "Hyaluronic Acid", "mechanism": "attract + retain moisture", "target_concern": "dehydration + tightness"},
+            {"name": "Ceramides", "mechanism": "repair skin barrier", "target_concern": "dryness + flakiness"},
+            {"name": "Glycerin", "mechanism": "humectant moisture binding", "target_concern": "dry + rough texture"},
+        ],
+        "oily_skin": [
+            {"name": "Niacinamide", "mechanism": "regulate sebum production", "target_concern": "excess oil + enlarged pores"},
+            {"name": "Salicylic Acid", "mechanism": "exfoliate + reduce oiliness", "target_concern": "shine + congestion"},
+            {"name": "Zinc", "mechanism": "control oil secretion", "target_concern": "oiliness + breakouts"},
+        ],
+        "dark_spots": [
+            {"name": "Vitamin C", "mechanism": "inhibit melanin synthesis", "target_concern": "hyperpigmentation + dullness"},
+            {"name": "Alpha Arbutin", "mechanism": "block tyrosinase enzyme", "target_concern": "melasma + PIH"},
+            {"name": "Niacinamide", "mechanism": "reduce pigment transfer", "target_concern": "uneven tone + dark spots"},
+        ],
+        "sensitive_skin": [
+            {"name": "Centella Asiatica", "mechanism": "calm + repair skin barrier", "target_concern": "redness + sensitivity"},
+            {"name": "Ceramides", "mechanism": "restore barrier function", "target_concern": "reactivity + irritation"},
+            {"name": "Allantoin", "mechanism": "soothe + protect skin", "target_concern": "sensitivity + redness"},
+        ],
+        "anti_aging": [
+            {"name": "Retinol", "mechanism": "boost cell turnover + collagen", "target_concern": "fine lines + texture"},
+            {"name": "Vitamin C", "mechanism": "stimulate collagen synthesis", "target_concern": "wrinkles + firmness"},
+            {"name": "Peptides", "mechanism": "signal collagen production", "target_concern": "sagging + elasticity"},
+        ],
+        "hair_loss": [
+            {"name": "Minoxidil", "mechanism": "increase follicle blood flow", "target_concern": "thinning + shedding"},
+            {"name": "Biotin", "mechanism": "support keratin production", "target_concern": "weak + thinning strands"},
+            {"name": "Caffeine", "mechanism": "stimulate follicle growth phase", "target_concern": "hair density + loss"},
+        ],
+        "dandruff": [
+            {"name": "Zinc Pyrithione", "mechanism": "inhibit Malassezia yeast", "target_concern": "dandruff + scalp flaking"},
+            {"name": "Salicylic Acid", "mechanism": "dissolve scalp buildup", "target_concern": "flakes + itchy scalp"},
+            {"name": "Ketoconazole", "mechanism": "antifungal scalp treatment", "target_concern": "seborrheic dermatitis"},
+        ],
+        "dull_skin": [
+            {"name": "Vitamin C", "mechanism": "brighten + even skin tone", "target_concern": "dullness + radiance"},
+            {"name": "AHA (Glycolic Acid)", "mechanism": "exfoliate dead surface cells", "target_concern": "dullness + texture"},
+            {"name": "Niacinamide", "mechanism": "improve skin clarity + glow", "target_concern": "uneven tone + dullness"},
+        ],
+        "large_pores": [
+            {"name": "Niacinamide", "mechanism": "tighten + minimise pore appearance", "target_concern": "enlarged pores + oiliness"},
+            {"name": "Retinol", "mechanism": "increase cell turnover + firm skin", "target_concern": "pore size + texture"},
+            {"name": "Salicylic Acid", "mechanism": "clear pore congestion", "target_concern": "blocked pores + blackheads"},
+        ],
+        "general_skincare": [
+            {"name": "SPF Sunscreen", "mechanism": "block UV-induced damage", "target_concern": "photoaging + protection"},
+            {"name": "Niacinamide", "mechanism": "multi-benefit barrier support", "target_concern": "general skin health"},
+            {"name": "Hyaluronic Acid", "mechanism": "hydrate + plump skin", "target_concern": "hydration + texture"},
+        ],
+    }
+
     # Stage1: ingredient reasoning from KB — no products needed
     INGREDIENTS_SYSTEM = """You are a clinical dermatology assistant. Output ONLY valid JSON.
 
@@ -862,8 +954,10 @@ Rules:
                 )
                 if state.kb_context:
                     ctx += f"Dermatology Knowledge Context:\n{state.kb_context}"
+                    logger.info(f"Stage1 LLM: using KB context ({len(state.kb_context)} chars)")
                 else:
                     ctx += "Apply established clinical dermatology knowledge for this concern."
+                    logger.info("Stage1 LLM: no KB context — using clinical training knowledge")
                 raw = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=350).strip()
                 parsed = _parse_json(raw)
                 actives = parsed.get("actives", []) if parsed else []
@@ -872,8 +966,23 @@ Rules:
                         f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
                         for a in actives
                     )
+                    logger.info(f"Stage1: LLM returned {len(actives)} actives")
+                else:
+                    logger.warning(f"Stage1: LLM returned empty actives (raw={raw[:80]!r}) — will use fallback")
             except Exception as e:
-                logger.error(f"Stage1 ingredient rationale failed: {e}")
+                logger.error(f"Stage1 ingredient rationale LLM failed: {e}")
+
+        # Fallback: use curated concern-to-actives map when LLM returns nothing
+        if not actives:
+            concern_key = state.identified_concern or "general_skincare"
+            fallback = self.ACTIVES_FALLBACK.get(concern_key) or self.ACTIVES_FALLBACK.get("general_skincare", [])
+            if fallback:
+                actives = fallback[:3]
+                ingredient_rationale = "\n".join(
+                    f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
+                    for a in actives
+                )
+                logger.info(f"Stage1 fallback: using curated actives for '{concern_key}' ({len(actives)} items)")
         return {
             "actives": actives,
             "ingredient_rationale": ingredient_rationale,

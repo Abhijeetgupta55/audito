@@ -411,16 +411,33 @@ export default function Consultation() {
           timeout: 90000,
         });
 
-        const hasActives = (data.actives || []).length > 0 || !!data.ingredient_rationale;
         const isIntake = !data.recommendation && !!data.diagnosis &&
           (data.agent_path || []).slice(-1)[0] === 'diagnosis';
+        // CTA shown whenever a real concern was identified — not gated on actives existing
+        const hasConcern = !isIntake && !!(
+          data.identified_concern &&
+          data.identified_concern !== 'none' &&
+          data.identified_concern !== 'unclear_image'
+        );
+
+        const stage2Payload = hasConcern ? {
+          session_key: data.session_key || null,
+          identified_concern: data.identified_concern || '',
+          severity: data.severity || 'mild',
+          skin_type: data.skin_analysis?.skin_type || 'unknown',
+          user_message: text || 'Please analyze my skin or hair condition from this photo.',
+          kb_context: data.kb_context || '',
+          diagnosis: data.diagnosis || '',
+          ingredient_rationale: data.ingredient_rationale || '',
+          skin_analysis: data.skin_analysis || null,
+        } : null;
 
         addMsg({
           role: 'assistant',
           type: 'response',
           content: data.diagnosis || 'Analysis complete.',
           intent: data.intent,
-          concern: data.identified_concern,
+          concern: data.identified_concern || '',
           severity: data.severity,
           diagnosis: data.diagnosis,
           diagnosisData: data.diagnosis_data || {},
@@ -429,24 +446,15 @@ export default function Consultation() {
           recommendation: data.recommendation || '',
           recommendationData: data.recommendation_data || {},
           skinAnalysis: data.skin_analysis,
+          lowConfidence: !!(data.skin_analysis?.low_confidence),
           progressReport: data.progress_report,
           products: [],
           warnings: data.warnings || [],
           agentPath: data.agent_path || [],
           isIntakeQuestion: isIntake,
-          stage2Pending: hasActives && !isIntake,
+          stage2Pending: hasConcern,
           stage2Loading: false,
-          stage2Data: hasActives && !isIntake ? {
-            session_key: data.session_key || null,
-            identified_concern: data.identified_concern || '',
-            severity: data.severity || 'mild',
-            skin_type: data.skin_analysis?.skin_type || 'unknown',
-            user_message: text || 'Please analyze my skin or hair condition from this photo.',
-            kb_context: data.kb_context || '',
-            diagnosis: data.diagnosis || '',
-            ingredient_rationale: data.ingredient_rationale || '',
-            skin_analysis: data.skin_analysis || null,
-          } : null,
+          stage2Data: stage2Payload,
         });
 
       } catch (err) {
