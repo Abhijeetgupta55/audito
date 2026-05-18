@@ -20,8 +20,7 @@ export function buildCards(msg) {
     msg.stage2Pending ||
     msg.stage2Loading ||
     msg.progressReport ||
-    msg.diagnosis ||
-    msg.concern  // a real concern was identified even if other fields are sparse
+    msg.diagnosis
   );
   if (!hasStructure) return [];
 
@@ -70,8 +69,8 @@ export function buildCards(msg) {
     } else {
       cards.push({ type: 'actives_pending' });
     }
-  } else if (!msg.isIntakeQuestion && (msg.diagnosisData?.diagnosis_summary?.length || msg.diagnosis || msg.concern)) {
-    // Has a real concern/diagnosis but actives not yet available
+  } else if (msg.stage2Pending) {
+    // Image analysis ran and concern confirmed, but actives not yet generated
     cards.push({ type: 'actives_pending' });
   }
 
