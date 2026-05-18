@@ -48,7 +48,8 @@ export function buildCards(msg) {
     });
   } else if (msg.diagnosis) {
     const lines = msg.diagnosis.split('\n').filter(l => l.trim()).map(l => l.replace(/^[•\-*]\s*/, ''));
-    if (lines.length) {
+    if (lines.length >= 2) {
+      // Only render as card if properly multi-line — single paragraphs fall through to text bubble
       cards.push({ type: 'summary', concerns: [], severity: msg.severity, bullets: lines });
     }
   }
