@@ -737,8 +737,19 @@ class ProductSearchAgent:
                 logger.warning("RAG unavailable, falling back to keyword search")
                 from backend.vector_store import get_pinecone_store
                 local = await get_pinecone_store()
+                # Always retrieve products for full; for stage1 also try KB from local store
                 if state.stage == "full":
                     products = local.search_products(query, top_k=5)
+                else:
+                    # stage1: try to get KB context from local store search results as text
+                    raw_products = local.search_products(query, top_k=3)
+                    if raw_products:
+                        kb_context = "\n".join(
+                            f"{p.get('name','')}: {p.get('description','')} "
+                            f"[Ingredients: {', '.join(p.get('key_ingredients',[])[:4])}]"
+                            for p in raw_products
+                        )
+                        logger.info(f"Stage1 fallback KB: built from {len(raw_products)} products")
 
             return {
                 "search_query": query,
@@ -843,13 +854,16 @@ Rules:
         obs = state.skin_analysis.get("clinical_observation", "") if state.skin_analysis else ""
         actives: List[Dict[str, str]] = []
         ingredient_rationale = ""
-        if _ensure_gemini() and state.kb_context:
+        if _ensure_gemini():
             try:
                 ctx = (
                     f"Concern: {state.identified_concern.replace('_', ' ')} ({state.severity})\n"
                     f"Clinical observation: {obs or 'N/A'}\n\n"
-                    f"Dermatology Knowledge Context:\n{state.kb_context}"
                 )
+                if state.kb_context:
+                    ctx += f"Dermatology Knowledge Context:\n{state.kb_context}"
+                else:
+                    ctx += "Apply established clinical dermatology knowledge for this concern."
                 raw = _generate([self.INGREDIENTS_SYSTEM, ctx], max_tokens=350).strip()
                 parsed = _parse_json(raw)
                 actives = parsed.get("actives", []) if parsed else []
