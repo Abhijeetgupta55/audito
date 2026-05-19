@@ -259,19 +259,49 @@ async def _agenerate(
 
 
 def _parse_json(text: str) -> Dict:
-    """Strip markdown fences and parse JSON."""
-    text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
-    # Handle potential trailing commas
+    """Aggressive JSON extraction.
+
+    Smaller / lighter models (flash-lite, etc) often wrap JSON in prose
+    ("Here is the analysis:", trailing explanations) or add trailing commas.
+    This parser tries several strategies in order before giving up.
+    """
+    if not text:
+        return {}
+
+    # Strategy 1: strip markdown fences and try direct parse
+    cleaned = re.sub(r"```(?:json|JSON)?", "", text).replace("```", "").strip()
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to extract JSON object
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except Exception:
-                pass
+        pass
+
+    # Strategy 2: extract substring between first { and last } (handles surrounding prose)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        candidate = cleaned[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 3: remove trailing commas before } and ]
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 4: also strip JS-style comments (// and /* */) the model sometimes adds
+        repaired = re.sub(r"//.*?$", "", repaired, flags=re.MULTILINE)
+        repaired = re.sub(r"/\*.*?\*/", "", repaired, flags=re.DOTALL)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 5: log the unparseable text so we can iterate on the parser
+    logger.warning(f"_parse_json: all strategies failed on text (first 300 chars): {text[:300]!r}")
     return {}
 
 
@@ -560,12 +590,36 @@ Respond ONLY in valid JSON:
             analysis = _parse_json(text)
             logger.info(f"Vision parsed JSON keys: {list(analysis.keys()) if analysis else '(empty)'}")
 
-            # Step 3: check if parsing yielded anything useful
+            # Step 3: if JSON parsing failed, try one more pass via the LLM itself —
+            # send the model's previous prose response back and ask it to reformat as JSON.
+            # This is a single retry, no recursion. Worst case: 1 extra API call,
+            # but it recovers what would otherwise be a dead-end.
+            if not analysis and text:
+                logger.warning(f"Vision: first JSON parse failed — attempting reformat. Raw: {text[:200]!r}")
+                reformat_prompt = (
+                    "The following is supposed to be a JSON object describing skin analysis but is malformed "
+                    "or wrapped in prose. Extract and return ONLY the valid JSON object — no other text, "
+                    "no markdown fences, no commentary. If multiple JSON-like structures exist, return the "
+                    "most complete one matching the schema {is_clear, skin_type, conditions, severity, "
+                    "primary_concern, clinical_observation, metrics}.\n\n"
+                    f"INPUT:\n{text[:2000]}"
+                )
+                reformatted = await _agenerate(
+                    [reformat_prompt],
+                    model_name=settings.GEMINI_MODEL,  # use text model, not vision
+                    max_tokens=800,
+                    retries=0,
+                )
+                if reformatted:
+                    analysis = _parse_json(reformatted)
+                    logger.info(f"Vision reformat: recovered keys={list(analysis.keys()) if analysis else '(still empty)'}")
+
+            # Step 4: if still nothing, return clear error
             if not analysis:
-                logger.error(f"Vision: JSON parse failed — raw response: {text[:200]!r}")
+                logger.error(f"Vision: JSON parse failed even after reformat — raw response: {text[:300]!r}")
                 return {
                     "skin_analysis": {"is_clear": False, "metrics": {}},
-                    "vision_feedback": "The AI service returned an unexpected response format. This usually clears up on retry — please upload the image again.",
+                    "vision_feedback": "The vision model returned an unexpected response format. Please retry — this usually clears up on the second attempt.",
                     "identified_concern": "vision_error",
                     "current_agent": "conversational",
                     "agent_history": state.agent_history + ["vision"],
