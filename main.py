@@ -440,9 +440,13 @@ async def analyze_image(
             )
 
         # ── Save progress ─────────────────────────────────────────────────────
+        # Always attempt save — progress_store._is_meaningful() decides whether
+        # the metrics deserve persistence. The previous outer `is_clear` gate
+        # dropped partial-but-usable analyses (is_clear=False + low_confidence
+        # path) even though they carried real metrics, breaking comparisons.
         record_id = None
-        if state.skin_analysis and state.skin_analysis.get("is_clear", True):
-            metrics = state.skin_analysis.get("metrics", {})
+        if state.skin_analysis:
+            metrics = state.skin_analysis.get("metrics", {}) or {}
             try:
                 record_id = progress_store.save_analysis(
                     user_id=effective_user,
@@ -452,12 +456,13 @@ async def analyze_image(
             except Exception as e:
                 logger.error(f"[{request_id}] Progress save failed: {e}")
 
+        # Always fetch the full report — prior records must surface even if
+        # this particular upload didn't qualify for save.
         progress_data = None
-        if record_id:
-            try:
-                progress_data = progress_store.get_progress_report(effective_user)
-            except Exception as e:
-                logger.error(f"[{request_id}] Progress fetch failed: {e}")
+        try:
+            progress_data = progress_store.get_progress_report(effective_user)
+        except Exception as e:
+            logger.error(f"[{request_id}] Progress fetch failed: {e}")
 
         return {
             "request_id": request_id,
