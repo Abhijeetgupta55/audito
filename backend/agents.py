@@ -200,6 +200,14 @@ def _generate(
         if json_mode:
             cfg_kwargs["response_mime_type"] = "application/json"
 
+        # Disable extended thinking on Gemini 2.5 — thinking tokens are counted
+        # against max_output_tokens and routinely starve the visible JSON output,
+        # producing empty/truncated responses that look like "vision model returned
+        # unexpected response format". /test-gemini shows ~390 thought tokens on
+        # trivial prompts, which leaves nothing for a 500-token vision schema.
+        if "2.5" in name:
+            cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
             model=name,
