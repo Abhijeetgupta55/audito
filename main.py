@@ -100,6 +100,10 @@ class ChatResponse(BaseModel):
     warnings: list
     latency_ms: float
     tokens_used: int
+    # Diagnostic flags so the caller can see what's real vs hardcoded fallback
+    rag_used: bool = False           # True if ChromaDB vector search returned KB chunks
+    kb_chars_retrieved: int = 0      # length of RAG-retrieved knowledge context
+    actives_source: str = "unknown"  # "llm" | "fallback" | "none"
 
 
 class DoctorFeedback(BaseModel):
@@ -207,6 +211,77 @@ async def test_gemini():
         }
 
 
+@app.get("/test-rag")
+async def test_rag():
+    """Diagnostic endpoint — verifies the RAG pipeline is actually real.
+
+    Reports:
+      - Whether ChromaDB initialized successfully (no silent fallback)
+      - How many KB chunks and products are indexed
+      - A live similarity search result so you can see real vector retrieval
+    """
+    from backend.rag_store import get_rag_store, _DEPS_OK
+
+    if not _DEPS_OK:
+        return {
+            "status": "fake",
+            "reason": "RAG dependencies (langchain/chromadb) not installed — all 'RAG' queries fall back to keyword search in vector_store.py",
+            "rag_real": False,
+        }
+
+    store = await get_rag_store()
+    if store is None:
+        return {
+            "status": "fake",
+            "reason": "RagStore failed to initialize — system is using LocalProductStore keyword fallback (not real RAG)",
+            "rag_real": False,
+        }
+
+    try:
+        kb_count = store.kb_vectorstore._collection.count()
+        product_count = store.product_vectorstore._collection.count()
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Failed to count ChromaDB collections: {e}",
+            "rag_real": False,
+        }
+
+    # Run a live test query to prove vector search is working
+    test_query = "salicylic acid for acne"
+    try:
+        kb_sample = store.search_knowledge(test_query, top_k=2)
+        product_sample = store.search_products(test_query, top_k=3)
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"RAG initialized but live search failed: {e}",
+            "rag_real": False,
+            "kb_chunks": kb_count,
+            "products_indexed": product_count,
+        }
+
+    return {
+        "status": "ok",
+        "rag_real": True,
+        "rag_implementation": "ChromaDB + GeminiEmbeddings (gemini-embedding-001)",
+        "kb_chunks_indexed": kb_count,
+        "products_indexed": product_count,
+        "test_query": test_query,
+        "kb_retrieved_chars": len(kb_sample),
+        "kb_first_chunk_preview": kb_sample[:300] if kb_sample else None,
+        "products_retrieved": [
+            {
+                "name": p.get("name"),
+                "brand": p.get("brand"),
+                "similarity_score": p.get("similarity_score"),
+                "key_ingredients": p.get("key_ingredients", [])[:3],
+            }
+            for p in product_sample
+        ],
+    }
+
+
 @app.get("/health")
 async def health_check():
     store = await get_pinecone_store()
@@ -296,6 +371,9 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             warnings=state.safety_warnings,
             latency_ms=state.total_latency_ms,
             tokens_used=state.tokens_used,
+            rag_used=bool(state.kb_context),
+            kb_chars_retrieved=len(state.kb_context or ""),
+            actives_source=getattr(state, "_actives_source", "unknown"),
         )
 
         background_tasks.add_task(

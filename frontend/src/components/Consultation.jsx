@@ -355,7 +355,7 @@ export default function Consultation() {
       m.id === msgId ? { ...m, stage2Loading: true } : m
     ));
     try {
-      const { data } = await axios.post(`${API}/api/recommend-products`, stage2Data, { timeout: 30000 });
+      const { data } = await axios.post(`${API}/api/recommend-products`, stage2Data, { timeout: 60000 });
       setMessages(prev => prev.map(m =>
         m.id === msgId ? {
           ...m,
@@ -410,7 +410,7 @@ export default function Consultation() {
       try {
         const { data } = await axios.post(imageUrl, form, {
           headers: { 'Content-Type': 'multipart/form-data' },
-          timeout: 90000,
+          timeout: 180000,
         });
 
         const isIntake = !data.recommendation && !!data.diagnosis &&
@@ -486,7 +486,7 @@ export default function Consultation() {
         const { data } = await axios.post(chatUrl, {
           message: text,
           conversation_history: updatedHistory,
-        }, { timeout: 90000 });
+        }, { timeout: 120000 });
 
         const assistantContent = data.recommendation || data.diagnosis || 'I could not generate a response.';
 

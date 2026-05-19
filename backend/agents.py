@@ -153,14 +153,22 @@ def _extract_response(response, model_name: str) -> Tuple[str, str, str]:
     return text, finish_reason, safety_info
 
 
-def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None) -> str:
+def _generate(
+    prompt_parts: list,
+    model_name: str = None,
+    max_tokens: int = None,
+    json_mode: bool = False,
+) -> str:
     """
     Single synchronous Gemini call. Never raises, never retries.
     For retry logic use _agenerate() (async).
 
+    json_mode=True forces Gemini to return valid JSON via response_mime_type.
+    This eliminates the "model wrapped JSON in prose" failures that plague
+    lite/flash models — the API itself guarantees parseable JSON output.
+
     Respects a cooldown after recent 429s — when daily quota is exhausted, retrying
-    immediately burns more requests for nothing. The cooldown lets the pipeline
-    fail fast and fall back to templates instead of waiting on doomed retries.
+    immediately burns more requests for nothing.
     """
     global _quota_cooldown_until  # declared once for the whole function
     if time.time() < _quota_cooldown_until:
@@ -174,7 +182,7 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
 
     name = model_name or settings.GEMINI_MODEL
     preview = str(prompt_parts[0])[:100] if prompt_parts else ""
-    logger.info(f"_generate → {name} | {preview!r}")
+    logger.info(f"_generate → {name} | json={json_mode} | {preview!r}")
 
     try:
         cfg_kwargs: Dict[str, Any] = {
@@ -185,6 +193,12 @@ def _generate(prompt_parts: list, model_name: str = None, max_tokens: int = None
         # in newer google-genai versions.
         if max_tokens is not None and max_tokens > 0:
             cfg_kwargs["max_output_tokens"] = max_tokens
+
+        # Force JSON output mode when caller expects JSON. This makes Gemini
+        # guarantee valid JSON — no more prose wrappers, no more markdown fences,
+        # no more "could not interpret model response" errors.
+        if json_mode:
+            cfg_kwargs["response_mime_type"] = "application/json"
 
         cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         response = _client.models.generate_content(
@@ -231,19 +245,29 @@ async def _agenerate(
     model_name: str = None,
     max_tokens: int = None,
     retries: int = 1,
+    json_mode: bool = False,
 ) -> str:
     """
-    Async wrapper around _generate with non-blocking retry on transient empty.
-    retries=0 → single attempt (use for fast conversational paths).
-    retries=1 → one retry after 1.5s (default).
-    retries=2 → two retries for critical paths (vision).
+    Async wrapper around _generate with retry on transient empty.
+
+    json_mode=True forces Gemini's response_mime_type to application/json,
+    guaranteeing valid parseable JSON output. Use for all JSON-schema prompts.
+
+    Smart-retry: skips remaining retries if quota cooldown is active (no point
+    waiting between attempts when we know the next call will be skipped).
     """
     for attempt in range(retries + 1):
-        text = _generate(prompt_parts, model_name, max_tokens)
+        text = _generate(prompt_parts, model_name, max_tokens, json_mode=json_mode)
         if text:
             return text
+        # Bail out early if quota was hit — further retries will hit the cooldown
+        # and return empty without making an actual API call. Waiting between
+        # them just adds latency for no reason.
+        if time.time() < _quota_cooldown_until:
+            logger.warning("_agenerate: quota cooldown active — skipping remaining retries")
+            break
         if attempt < retries:
-            wait = 1.5 * (attempt + 1)
+            wait = 1.0  # reduced from 1.5s
             logger.warning(
                 f"_agenerate: empty on attempt {attempt + 1}/{retries + 1} — "
                 f"retrying in {wait:.1f}s"
@@ -359,6 +383,9 @@ class AgentState:
     total_latency_ms: float = 0
     tokens_used: int = 0
 
+    # Diagnostic provenance — lets callers tell what's real vs hardcoded
+    _actives_source: str = "unknown"   # "llm" | "fallback" | "none"
+
 
 # ---------------------------------------------------------------------------
 # CONCERN keywords for fallback triage
@@ -470,6 +497,7 @@ Respond ONLY with valid JSON:
                         [self.SYSTEM, f"\nUser message: {state.user_message}"],
                         max_tokens=200,
                         retries=1,
+                        json_mode=True,
                     )
                     result = _parse_json(text)
                     logger.info(f"Triage LLM result: {result}")
@@ -550,9 +578,12 @@ Respond ONLY in valid JSON:
             return {"current_agent": "diagnosis"}
 
         if not _ensure_gemini():
+            # No fake placeholder analysis — surface the error and stop.
             return {
-                "skin_analysis": {"skin_type": "unknown", "conditions": [state.identified_concern or "general"]},
-                "current_agent": "diagnosis",
+                "skin_analysis": {"is_clear": False, "metrics": {}},
+                "vision_feedback": "The AI service is not configured (GEMINI_API_KEY missing on server). Image analysis is unavailable.",
+                "identified_concern": "vision_error",
+                "current_agent": "conversational",
                 "agent_history": state.agent_history + ["vision"],
             }
 
@@ -570,8 +601,9 @@ Respond ONLY in valid JSON:
             text = await _agenerate(
                 [self.SYSTEM, img_part],
                 model_name=settings.GEMINI_VISION_MODEL,
-                max_tokens=800,
-                retries=2,
+                max_tokens=500,  # JSON schema needs ~400 tokens; 500 leaves headroom
+                retries=1,
+                json_mode=True,  # force valid JSON output
             )
             logger.info(f"Vision raw response: {len(text)} chars — preview: {text[:120]!r}")
 
@@ -586,40 +618,19 @@ Respond ONLY in valid JSON:
                     "agent_history": state.agent_history + ["vision"],
                 }
 
-            # Step 2: parse JSON
+            # Step 2: parse JSON — _parse_json now has 4 cleanup strategies built in
+            # (markdown strip, substring extract, trailing comma fix, comment strip)
+            # so no need for a separate LLM-reformat retry that would add latency
+            # and risk hallucinated content.
             analysis = _parse_json(text)
             logger.info(f"Vision parsed JSON keys: {list(analysis.keys()) if analysis else '(empty)'}")
 
-            # Step 3: if JSON parsing failed, try one more pass via the LLM itself —
-            # send the model's previous prose response back and ask it to reformat as JSON.
-            # This is a single retry, no recursion. Worst case: 1 extra API call,
-            # but it recovers what would otherwise be a dead-end.
-            if not analysis and text:
-                logger.warning(f"Vision: first JSON parse failed — attempting reformat. Raw: {text[:200]!r}")
-                reformat_prompt = (
-                    "The following is supposed to be a JSON object describing skin analysis but is malformed "
-                    "or wrapped in prose. Extract and return ONLY the valid JSON object — no other text, "
-                    "no markdown fences, no commentary. If multiple JSON-like structures exist, return the "
-                    "most complete one matching the schema {is_clear, skin_type, conditions, severity, "
-                    "primary_concern, clinical_observation, metrics}.\n\n"
-                    f"INPUT:\n{text[:2000]}"
-                )
-                reformatted = await _agenerate(
-                    [reformat_prompt],
-                    model_name=settings.GEMINI_MODEL,  # use text model, not vision
-                    max_tokens=800,
-                    retries=0,
-                )
-                if reformatted:
-                    analysis = _parse_json(reformatted)
-                    logger.info(f"Vision reformat: recovered keys={list(analysis.keys()) if analysis else '(still empty)'}")
-
-            # Step 4: if still nothing, return clear error
+            # Step 3: if still nothing, return clear honest error
             if not analysis:
-                logger.error(f"Vision: JSON parse failed even after reformat — raw response: {text[:300]!r}")
+                logger.error(f"Vision: JSON parse failed — raw response: {text[:300]!r}")
                 return {
                     "skin_analysis": {"is_clear": False, "metrics": {}},
-                    "vision_feedback": "The vision model returned an unexpected response format. Please retry — this usually clears up on the second attempt.",
+                    "vision_feedback": "The vision model returned an unexpected response format. Please retry the image.",
                     "identified_concern": "vision_error",
                     "current_agent": "conversational",
                     "agent_history": state.agent_history + ["vision"],
@@ -674,8 +685,12 @@ Respond ONLY in valid JSON:
 
         except Exception as e:
             logger.error(f"Vision Agent failed: {e}")
+            # No silent skip — surface the error so the user knows analysis failed.
             return {
-                "current_agent": "diagnosis",
+                "skin_analysis": {"is_clear": False, "metrics": {}},
+                "vision_feedback": f"Image analysis failed unexpectedly: {type(e).__name__}. Please try again.",
+                "identified_concern": "vision_error",
+                "current_agent": "conversational",
                 "agent_history": state.agent_history + ["vision"],
             }
 
@@ -825,8 +840,9 @@ Rules:
         try:
             raw_diff = (await _agenerate(
                 [self.DIFFERENTIAL_SYSTEM, diff_prompt],
-                max_tokens=350,
+                max_tokens=250,  # output is 3 bullets + JSON wrapper, 250 is plenty
                 retries=1,
+                json_mode=True,  # force valid JSON output
             )).strip()
             if raw_diff:
                 diagnosis_data_parsed = _parse_json(raw_diff)
@@ -844,25 +860,15 @@ Rules:
 
         except Exception as e:
             logger.error(f"Differential diagnosis LLM failed: {e}")
-            concern_label = state.identified_concern.replace("_", " ")
-            if state.skin_analysis and state.skin_analysis.get("clinical_observation"):
-                conds = ", ".join(state.skin_analysis.get("conditions", []))
-                diagnosis_text = (
-                    f"• Findings consistent with {conds or concern_label}.\n"
-                    "• Extent and severity cannot be confirmed without physical examination.\n"
-                    "• Review matched products below; consult a dermatologist for a confirmed diagnosis."
-                )
-            else:
-                diagnosis_text = (
-                    f"• Description consistent with {concern_label}.\n"
-                    "• Cannot assess severity or rule out differentials without examination.\n"
-                    "• Provide more detail or consult a dermatologist for a confirmed diagnosis."
-                )
+            # No fake template — show the real error so the user knows it failed.
             return {
-                "diagnosis": diagnosis_text,
+                "diagnosis": (
+                    "The AI service couldn't generate a diagnosis right now "
+                    "(likely Gemini API quota or connection issue). Please try again later."
+                ),
                 "diagnosis_data": {},
                 "show_products": False,
-                "current_agent": "search" if state.identified_concern else "safety",
+                "current_agent": None,
                 "agent_history": state.agent_history + ["diagnosis"],
             }
 
@@ -1058,64 +1064,8 @@ class ProductSearchAgent:
 # ---------------------------------------------------------------------------
 
 class RecommendationAgent:
-    # Concern-to-actives fallback — used when LLM/RAG returns empty actives
-    ACTIVES_FALLBACK: Dict[str, List[Dict[str, str]]] = {
-        "acne": [
-            {"name": "Niacinamide", "mechanism": "reduce sebum + calm inflammation", "target_concern": "acne + oiliness"},
-            {"name": "Salicylic Acid", "mechanism": "exfoliate + unclog pores", "target_concern": "blackheads + breakouts"},
-            {"name": "Benzoyl Peroxide", "mechanism": "eliminate acne bacteria", "target_concern": "active breakouts"},
-        ],
-        "dry_skin": [
-            {"name": "Hyaluronic Acid", "mechanism": "attract + retain moisture", "target_concern": "dehydration + tightness"},
-            {"name": "Ceramides", "mechanism": "repair skin barrier", "target_concern": "dryness + flakiness"},
-            {"name": "Glycerin", "mechanism": "humectant moisture binding", "target_concern": "dry + rough texture"},
-        ],
-        "oily_skin": [
-            {"name": "Niacinamide", "mechanism": "regulate sebum production", "target_concern": "excess oil + enlarged pores"},
-            {"name": "Salicylic Acid", "mechanism": "exfoliate + reduce oiliness", "target_concern": "shine + congestion"},
-            {"name": "Zinc", "mechanism": "control oil secretion", "target_concern": "oiliness + breakouts"},
-        ],
-        "dark_spots": [
-            {"name": "Vitamin C", "mechanism": "inhibit melanin synthesis", "target_concern": "hyperpigmentation + dullness"},
-            {"name": "Alpha Arbutin", "mechanism": "block tyrosinase enzyme", "target_concern": "melasma + PIH"},
-            {"name": "Niacinamide", "mechanism": "reduce pigment transfer", "target_concern": "uneven tone + dark spots"},
-        ],
-        "sensitive_skin": [
-            {"name": "Centella Asiatica", "mechanism": "calm + repair skin barrier", "target_concern": "redness + sensitivity"},
-            {"name": "Ceramides", "mechanism": "restore barrier function", "target_concern": "reactivity + irritation"},
-            {"name": "Allantoin", "mechanism": "soothe + protect skin", "target_concern": "sensitivity + redness"},
-        ],
-        "anti_aging": [
-            {"name": "Retinol", "mechanism": "boost cell turnover + collagen", "target_concern": "fine lines + texture"},
-            {"name": "Vitamin C", "mechanism": "stimulate collagen synthesis", "target_concern": "wrinkles + firmness"},
-            {"name": "Peptides", "mechanism": "signal collagen production", "target_concern": "sagging + elasticity"},
-        ],
-        "hair_loss": [
-            {"name": "Minoxidil", "mechanism": "increase follicle blood flow", "target_concern": "thinning + shedding"},
-            {"name": "Biotin", "mechanism": "support keratin production", "target_concern": "weak + thinning strands"},
-            {"name": "Caffeine", "mechanism": "stimulate follicle growth phase", "target_concern": "hair density + loss"},
-        ],
-        "dandruff": [
-            {"name": "Zinc Pyrithione", "mechanism": "inhibit Malassezia yeast", "target_concern": "dandruff + scalp flaking"},
-            {"name": "Salicylic Acid", "mechanism": "dissolve scalp buildup", "target_concern": "flakes + itchy scalp"},
-            {"name": "Ketoconazole", "mechanism": "antifungal scalp treatment", "target_concern": "seborrheic dermatitis"},
-        ],
-        "dull_skin": [
-            {"name": "Vitamin C", "mechanism": "brighten + even skin tone", "target_concern": "dullness + radiance"},
-            {"name": "AHA (Glycolic Acid)", "mechanism": "exfoliate dead surface cells", "target_concern": "dullness + texture"},
-            {"name": "Niacinamide", "mechanism": "improve skin clarity + glow", "target_concern": "uneven tone + dullness"},
-        ],
-        "large_pores": [
-            {"name": "Niacinamide", "mechanism": "tighten + minimise pore appearance", "target_concern": "enlarged pores + oiliness"},
-            {"name": "Retinol", "mechanism": "increase cell turnover + firm skin", "target_concern": "pore size + texture"},
-            {"name": "Salicylic Acid", "mechanism": "clear pore congestion", "target_concern": "blocked pores + blackheads"},
-        ],
-        "general_skincare": [
-            {"name": "SPF Sunscreen", "mechanism": "block UV-induced damage", "target_concern": "photoaging + protection"},
-            {"name": "Niacinamide", "mechanism": "multi-benefit barrier support", "target_concern": "general skin health"},
-            {"name": "Hyaluronic Acid", "mechanism": "hydrate + plump skin", "target_concern": "hydration + texture"},
-        ],
-    }
+    # NO hardcoded fallbacks — if the LLM fails, return empty actives + an honest
+    # error message. The user explicitly wants real output or nothing.
 
     # Stage1: ingredient reasoning from KB — no products needed
     INGREDIENTS_SYSTEM = """You are a clinical dermatology assistant. Output ONLY valid JSON.
@@ -1211,8 +1161,9 @@ Rules:
                     logger.info("Stage1 LLM: no KB context — using clinical training knowledge")
                 raw = (await _agenerate(
                     [self.INGREDIENTS_SYSTEM, ctx],
-                    max_tokens=350,
+                    max_tokens=250,
                     retries=1,
+                    json_mode=True,  # force valid JSON output
                 )).strip()
                 parsed = _parse_json(raw)
                 actives = parsed.get("actives", []) if parsed else []
@@ -1221,23 +1172,22 @@ Rules:
                         f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
                         for a in actives
                     )
-                    logger.info(f"Stage1: LLM returned {len(actives)} actives")
+                    logger.info(f"Stage1: ✅ LLM returned {len(actives)} actives (REAL output)")
                 else:
-                    logger.warning(f"Stage1: LLM returned empty actives (raw={raw[:80]!r}) — will use fallback")
+                    logger.warning(f"Stage1: LLM returned empty actives (raw={raw[:80]!r}) — will surface error to user")
             except Exception as e:
                 logger.error(f"Stage1 ingredient rationale LLM failed: {e}")
 
-        # Fallback: use curated concern-to-actives map when LLM returns nothing
+        actives_source = "llm" if actives else "none"
+
+        # No hardcoded fallback — if LLM returned nothing, surface that honestly.
         if not actives:
-            concern_key = state.identified_concern or "general_skincare"
-            fallback = self.ACTIVES_FALLBACK.get(concern_key) or self.ACTIVES_FALLBACK.get("general_skincare", [])
-            if fallback:
-                actives = fallback[:3]
-                ingredient_rationale = "\n".join(
-                    f"• {a['name']} — {a.get('mechanism', '')} — {a.get('target_concern', '')}"
-                    for a in actives
-                )
-                logger.info(f"Stage1 fallback: using curated actives for '{concern_key}' ({len(actives)} items)")
+            ingredient_rationale = (
+                "The AI service couldn't generate ingredient recommendations right now "
+                "(likely Gemini API quota or connection issue). Please try again later."
+            )
+            logger.warning("Stage1: LLM returned empty actives — showing honest error, NO fake fallback")
+
         return {
             "actives": actives,
             "ingredient_rationale": ingredient_rationale,
@@ -1246,6 +1196,7 @@ Rules:
             "show_products": False,
             "current_agent": "safety",
             "agent_history": state.agent_history + ["recommendation"],
+            "_actives_source": actives_source,
         }
 
     # ── Stage 2: product text only ────────────────────────────────────────────
@@ -1280,8 +1231,9 @@ Rules:
                 )
                 raw = (await _agenerate(
                     [self.PRODUCTS_SYSTEM, ctx],
-                    max_tokens=350,
+                    max_tokens=250,
                     retries=1,
+                    json_mode=True,  # force valid JSON output
                 )).strip()
                 rec_data = _parse_json(raw) or {}
                 if rec_data.get("product_rationale"):
@@ -1341,6 +1293,7 @@ Rules:
                     [self.SYSTEM, user_ctx],
                     max_tokens=450,
                     retries=1,
+                    json_mode=True,  # force valid JSON output
                 )).strip()
                 rec_data = _parse_json(raw) or {}
                 actives = rec_data.get("actives", [])
@@ -1359,6 +1312,7 @@ Rules:
                     rec_text = "\n".join(lines)
             except Exception as e:
                 logger.error(f"Full recommendation LLM failed: {e}")
+        actives_source = "llm" if actives else "none"
         return {
             "actives": actives,
             "ingredient_rationale": ingredient_rationale,
@@ -1368,6 +1322,7 @@ Rules:
             "show_products": True,
             "current_agent": "safety",
             "agent_history": state.agent_history + ["recommendation"],
+            "_actives_source": actives_source,
         }
 
 
@@ -1407,12 +1362,11 @@ Rules:
                 logger.error(f"Doctor Expert Agent failed: {e}")
 
         if not guidance:
-            concern_label = state.identified_concern.replace("_", " ")
+            # No hardcoded template — surface the failure honestly.
             guidance = (
-                f"• **Urgency**: Severity warrants in-person evaluation — {concern_label} at {state.severity} level.\n"
-                "• **Do now**: Keep area clean, apply fragrance-free moisturiser if needed.\n"
-                "• **See**: Certified dermatologist — expect clinical examination and possible patch testing.\n"
-                "• **Avoid**: Self-medicating, harsh actives, or squeezing/picking before appointment."
+                "The AI service couldn't generate clinical guidance right now "
+                "(likely Gemini API quota or connection issue). "
+                "Please consult a dermatologist directly for severe concerns."
             )
 
         return {
@@ -1504,6 +1458,35 @@ class MultiAgentOrchestrator:
             if not agent:
                 logger.warning(f"Unknown agent: {state.current_agent}")
                 break
+
+            # PARALLELIZATION: when about to run Diagnosis, we know Search comes
+            # right after AND doesn't need Diagnosis output (Search uses
+            # identified_concern + severity which are already set by Triage/Vision).
+            # Running them concurrently saves ~10-15s on the image flow.
+            if (state.current_agent == "diagnosis"
+                    and state.identified_concern
+                    and not state.requires_doctor):
+                logger.info(f"[Step {step+1}] Running diagnosis + search IN PARALLEL")
+                diagnosis_result, search_result = await asyncio.gather(
+                    self.agents["diagnosis"].process(state),
+                    self.agents["search"].process(state),
+                )
+                # Merge diagnosis result (skip current_agent — we set it below)
+                for key, value in diagnosis_result.items():
+                    if hasattr(state, key) and key not in ("current_agent", "agent_history"):
+                        setattr(state, key, value)
+                # Merge search result (skip routing — Diagnosis decides next agent)
+                for key, value in search_result.items():
+                    if hasattr(state, key) and key not in ("current_agent", "agent_history"):
+                        setattr(state, key, value)
+                state.agent_history = state.agent_history + ["diagnosis", "search"]
+                # Honor Diagnosis's routing decision (doctor_expert vs recommendation).
+                # If Diagnosis bailed out (current_agent=None — intake question), respect that.
+                state.current_agent = diagnosis_result.get("current_agent", "recommendation")
+                # If Diagnosis routed to doctor_expert, skip recommendation entirely
+                if state.current_agent == "search":
+                    state.current_agent = "recommendation"
+                continue
 
             logger.info(f"[Step {step+1}] Running agent: {state.current_agent}")
             result = await agent.process(state)
