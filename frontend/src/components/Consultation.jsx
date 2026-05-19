@@ -1,23 +1,9 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import './Consultation.css';
 import DiagnosticDeck, { buildCards } from './DiagnosticDeck';
 
 const API = import.meta.env.VITE_API_URL || '';
-
-function getStableUserId() {
-  try {
-    let id = localStorage.getItem('audito_user_id');
-    if (!id) {
-      const rand = (crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
-      id = `u_${rand}`;
-      localStorage.setItem('audito_user_id', id);
-    }
-    return id;
-  } catch {
-    return 'anonymous';
-  }
-}
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
 
@@ -342,8 +328,6 @@ export default function Consultation() {
   const [pendingImage, setPendingImage] = useState(null);
   const [conversationHistory, setConversationHistory] = useState([]);
 
-  const userId = useMemo(() => getStableUserId(), []);
-
   const fileRef = useRef(null);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -419,7 +403,6 @@ export default function Consultation() {
 
       const form = new FormData();
       form.append('file', file);
-      form.append('user_id', userId);
       if (text) form.append('message', text);
 
       const imageUrl = `${API}/api/analyze-image`;
@@ -503,7 +486,6 @@ export default function Consultation() {
         const { data } = await axios.post(chatUrl, {
           message: text,
           conversation_history: updatedHistory,
-          user_id: userId,
         }, { timeout: 120000 });
 
         const assistantContent = data.recommendation || data.diagnosis || 'I could not generate a response.';
