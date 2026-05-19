@@ -68,10 +68,12 @@ export function buildCards(msg) {
     if (parsed.length) {
       cards.push({ type: 'actives', actives: parsed });
     } else {
-      cards.push({ type: 'actives_pending' });
+      // Unstructured text in ingredientRationale = honest backend error message.
+      // Show it directly instead of hiding behind a "still refining" spinner.
+      cards.push({ type: 'actives_error', text: msg.ingredientRationale });
     }
-  } else if (msg.stage2Pending) {
-    // Image analysis ran and concern confirmed, but actives not yet generated
+  } else if (msg.stage2Pending || msg.stage2Loading) {
+    // Genuinely still loading — show spinner only while a request is in flight
     cards.push({ type: 'actives_pending' });
   }
 
@@ -300,6 +302,18 @@ const ActivesPendingCard = ({ nav }) => (
   </div>
 );
 
+const ActivesErrorCard = ({ card, nav }) => (
+  <div className="dc dc-actives">
+    <div className="dc-head dc-head-dark">
+      <span className="dc-label-light">Recommended Actives</span>
+    </div>
+    <div className="dc-body dc-actives-pending-body">
+      <p className="dc-warning-text" style={{ margin: 0 }}>{card.text}</p>
+    </div>
+    {nav}
+  </div>
+);
+
 const WarningCard = ({ card, nav }) => (
   <div className={`dc dc-warning${card.severe ? ' dc-warning-severe' : ''}`}>
     <div className="dc-head">
@@ -436,6 +450,7 @@ export default function DiagnosticDeck({ msg, onGetProducts }) {
       case 'summary':          return <SummaryCard card={card} nav={nav} />;
       case 'actives':          return <ActivesCard card={card} nav={nav} />;
       case 'actives_pending':  return <ActivesPendingCard nav={nav} />;
+      case 'actives_error':    return <ActivesErrorCard card={card} nav={nav} />;
       case 'warning':          return <WarningCard card={card} nav={nav} />;
       case 'products_cta':     return <ProductsCTACard card={card} nav={nav} onCTA={handleCTA} />;
       case 'products_loading': return <ProductsLoadingCard nav={nav} />;

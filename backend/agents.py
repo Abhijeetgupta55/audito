@@ -282,6 +282,80 @@ async def _agenerate(
     return ""
 
 
+def _extract_actives_from_kb(kb_context: str, concern: str, top_n: int = 4) -> List[Dict[str, str]]:
+    """Pure-RAG extraction: parse ingredient sections directly from retrieved KB chunks.
+
+    The dermatology_kb.md file has a consistent format:
+        ### Ingredient Name (optional parenthetical)
+        - **Mechanism**: <one-line mechanism>
+        - **Benefits**: <comma-separated benefits>
+        - ...
+
+    Vector search returns the top-k most relevant chunks for the query. When the
+    LLM fails or is rate-limited, we can still produce REAL ingredient cards by
+    parsing the retrieved KB text directly. This is NOT a hardcoded fallback —
+    every name, mechanism, and benefit comes from the live KB.
+    """
+    if not kb_context:
+        return []
+
+    actives: List[Dict[str, str]] = []
+    seen_names = set()
+    # Find every ### section header followed by its body content
+    section_pattern = re.compile(r'###\s+([^\n]+)\n(.*?)(?=\n###|\Z)', re.DOTALL)
+
+    # Skip condition pages (Acne Management, etc.) — those aren't single ingredients
+    skip_terms = ('management', 'damage', 'support', 'dermatitis', 'aging and',
+                  'hyperpigmentation and', 'and skin', 'dehydration', 'and reactive')
+
+    for match in section_pattern.finditer(kb_context):
+        header = match.group(1).strip()
+        body = match.group(2)
+
+        # Strip leading "[N] " prefix that search_knowledge adds
+        header = re.sub(r'^\[\d+\]\s*', '', header)
+        lower_h = header.lower()
+        if any(term in lower_h for term in skip_terms):
+            continue
+
+        # Extract ingredient name (drop parenthetical: "Niacinamide (Vitamin B3)" → "Niacinamide")
+        name = re.sub(r'\s*\([^)]*\)', '', header).strip()
+        # Handle "AHAs — Glycolic Acid and Lactic Acid" style
+        name = name.split(' — ')[0].strip()
+        if not name or name.lower() in seen_names:
+            continue
+
+        # Mechanism line
+        mech_match = re.search(r'\*\*Mechanism\*\*:\s*([^\n]+)', body)
+        if not mech_match:
+            continue
+        mechanism = mech_match.group(1).strip()
+        # Trim long mechanisms to ~12 words for card display
+        m_words = mechanism.split()
+        if len(m_words) > 12:
+            mechanism = ' '.join(m_words[:12]).rstrip(',.;') + '…'
+
+        # Benefits → target_concern (first comma-separated benefit, trimmed)
+        benefit_match = re.search(r'\*\*Benefits\*\*:\s*([^\n]+)', body)
+        if benefit_match:
+            first_benefit = benefit_match.group(1).split(',')[0].strip().rstrip('.')
+            b_words = first_benefit.split()
+            target_concern = ' '.join(b_words[:6]) if b_words else concern.replace('_', ' ')
+        else:
+            target_concern = concern.replace('_', ' ')
+
+        actives.append({
+            "name": name,
+            "mechanism": mechanism,
+            "target_concern": target_concern,
+        })
+        seen_names.add(name.lower())
+        if len(actives) >= top_n:
+            break
+
+    return actives
+
+
 def _parse_json(text: str) -> Dict:
     """Aggressive JSON extraction.
 
